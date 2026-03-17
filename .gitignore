@@ -36,9 +36,9 @@ Thumbs.db
 *.ckpt
 
 # Generated outputs
-outputs/
-eval_outputs/
-visualizations/individual_samples/
+# outputs/
+# eval_outputs/
+# visualizations/individual_samples/
 
 # Dataset binaries / large local data
 dataset/images/

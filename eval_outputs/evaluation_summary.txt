@@ -1,0 +1,18 @@
+CROWD DENSITY ESTIMATION - EVALUATION SUMMARY
+==================================================
+
+dataset_name: Validation
+num_samples: 60
+average_mae: 10.9435
+average_mse: 181.6578
+average_pixel_mse: 0.0024
+average_loss: 0.0024
+correlation_coefficient: 0.0301
+mean_relative_error: 73.2023
+mean_predicted_count: 32.8236
+mean_ground_truth_count: 28.8333
+std_predicted_count: 2.8449
+std_ground_truth_count: 12.6414
+min_mae: 0.0267
+max_mae: 29.3214
+median_mae: 9.0964
