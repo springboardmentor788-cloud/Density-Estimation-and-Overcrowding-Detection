@@ -1,63 +1,78 @@
 import os
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
 from PIL import Image
+import numpy as np
 import scipy.io as sio
-
+import cv2
 
 class CrowdDataset(Dataset):
+    def __init__(self, root_dir, mode="train_data"):
+        self.img_dir = os.path.join(root_dir, mode, "images")
+        self.gt_dir = os.path.join(root_dir, mode, "ground_truth")
 
-    def __init__(self, img_path, gt_path):
-
-        self.img_path = img_path
-        self.gt_path = gt_path
-
-        self.image_list = [f for f in os.listdir(img_path) if f.endswith(".jpg")]
-
-        self.transform = transforms.Compose([
-            transforms.Resize((224,224)),
-            transforms.ToTensor()
+        self.img_list = sorted([
+            f for f in os.listdir(self.img_dir)
+            if f.endswith(".jpg")
         ])
 
+        print("✅ Loaded images:", len(self.img_list))
+
     def __len__(self):
-        return len(self.image_list)
+        return len(self.img_list)
 
     def __getitem__(self, idx):
+        img_name = self.img_list[idx]
 
-        img_name = self.image_list[idx]
+        img_path = os.path.join(self.img_dir, img_name)
+        gt_path = os.path.join(self.gt_dir, "GT_" + img_name.replace(".jpg", ".mat"))
 
-        img_file = os.path.join(self.img_path, img_name)
-        gt_file = os.path.join(self.gt_path, "GT_" + img_name.replace(".jpg",".mat"))
+        # ===== IMAGE =====
+        img = Image.open(img_path).convert("RGB")
+        w, h = img.size
 
-        # Load image
-        img = Image.open(img_file).convert("RGB")
-        width, height = img.size
+        img = img.resize((224, 224))
+        img = np.array(img).astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = torch.tensor(img)
 
-        img = self.transform(img)
+        # ===== LOAD GT =====
+        mat = sio.loadmat(gt_path)
 
-        # Load ground truth
-        mat = sio.loadmat(gt_file)
-        points = mat["image_info"][0][0][0][0][0]
+        # TRY MULTIPLE FORMATS (AUTO FIX)
+        try:
+            points = mat["image_info"][0][0][0][0][0]
+        except:
+            try:
+                points = mat["image_info"][0][0][0][0]
+            except:
+                try:
+                    points = mat["image_info"][0][0][0]
+                except:
+                    print("❌ GT format error:", gt_path)
+                    points = []
 
-        density = torch.zeros((1,224,224))
+        # ===== CREATE DENSITY =====
+        density = np.zeros((224, 224), dtype=np.float32)
 
-        # scale factors
-        scale_x = 224 / width
-        scale_y = 224 / height
+        scale_x = 224 / w
+        scale_y = 224 / h
 
         for p in points:
-
             x = int(p[0] * scale_x)
             y = int(p[1] * scale_y)
 
-            if x >= 224:
-                x = 223
-            if y >= 224:
-                y = 223
+            if x >= 224 or y >= 224:
+                continue
 
-            density[0,y,x] = 1
+            density[y, x] += 1
 
-        count = len(points)
+        #  DEBUG LINE (IMPORTANT)
+        # print("GT SUM:", density.sum())
 
-        return img, density, count
+        # Smooth density
+        density = cv2.GaussianBlur(density, (15, 15), 0)
+
+        density = torch.tensor(density).unsqueeze(0)
+
+        return img, density, 0
