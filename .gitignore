@@ -1,44 +1,40 @@
-# -----------------------------
-# Python bytecode / cache
-# -----------------------------
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-
-# -----------------------------
-# Virtual environments
-# -----------------------------
-venv/
-.venv/
-env/
-
-# -----------------------------
-# Tooling caches
-# -----------------------------
+*.so
 .pytest_cache/
 .mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
 
-# -----------------------------
-# IDE / OS files
-# -----------------------------
+# Virtual envs
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
 .vscode/
 .idea/
 .DS_Store
-Thumbs.db
 
-# -----------------------------
-# Model and training artifacts
-# -----------------------------
-*.pth
+# Large local datasets (keep out of GitHub)
+part_A_final/
+part_B_final/
+
+# Runtime outputs
+project/data/cache/
+project/data/runs/
+project/data/eval_vis/
+project/data/eval_reports/
+project/data/output/
+
+# Checkpoints and logs
 *.pt
-*.ckpt
+*.pth
+*.pth.tar
+*.log
 
-# Generated outputs
-# outputs/
-# eval_outputs/
-# visualizations/individual_samples/
-
-# Dataset binaries / large local data
-dataset/images/
+# Notebook noise
+.ipynb_checkpoints/
