@@ -1,0 +1,22 @@
+{
+  "dataset_root": ".",
+  "part": "A",
+  "split": "test",
+  "checkpoint": "project/data/runs/csrnet_partA_smoke_fp32/checkpoints/best.pt",
+  "model": "csrnet",
+  "metrics": {
+    "loss": 0.0140268877503631,
+    "mae": 108.59525322128128,
+    "rmse": 164.2400952895236,
+    "r2": 0.7844033840908606
+  },
+  "num_samples": 182,
+  "artifacts": {
+    "per_image_csv": "project/data/eval_reports/csrnet_partA_test_best/per_image_metrics.csv",
+    "metrics_panel": "project/data/eval_reports/csrnet_partA_test_best/metrics_panel.png",
+    "scatter_plot": "project/data/eval_reports/csrnet_partA_test_best/counts_scatter_gt_vs_pred.png",
+    "residual_hist": "project/data/eval_reports/csrnet_partA_test_best/counts_residual_hist.png",
+    "evaluation_matrix": "project/data/eval_reports/csrnet_partA_test_best/counts_evaluation_matrix.png",
+    "density_visualizations_dir": "project/data/eval_vis/partA_github_detailed"
+  }
+}
