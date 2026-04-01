@@ -72,6 +72,10 @@ class ShanghaiTechDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         points  = load_mat(mat_path)
+
+        # store actual head count
+        actual_count = len(points)
+
         H, W    = image.shape[1], image.shape[2]
         density = make_density_map(points, (H, W))
         density_tensor = torch.from_numpy(density).unsqueeze(0)
@@ -81,7 +85,7 @@ class ShanghaiTechDataset(Dataset):
             mode="bilinear", align_corners=False,
         ).squeeze(0)
         density_tensor = density_tensor * 64
-        return image, density_tensor, str(img_path)
+        return image, density_tensor, actual_count, str(img_path)
 
 
 class CSRNet(nn.Module):
@@ -91,7 +95,6 @@ class CSRNet(nn.Module):
         self.frontend = nn.Sequential(
             *list(vgg.features.children())[:23]
         )
-        # ── 4 layers  – must match train.py ──────────────────
         self.backend = nn.Sequential(
             nn.Conv2d(512, 256, 3, padding=2, dilation=2),
             nn.ReLU(inplace=True),
@@ -109,19 +112,39 @@ class CSRNet(nn.Module):
         return x
 
 
-def validate(model, dataloader):
+def compute_scale_factor(model, dataloader):
+    """Compute best scale factor from validation data."""
+    model.eval()
+    ratios = []
+    with torch.no_grad():
+        for images, targets, actual_counts, _ in dataloader:
+            images = images.to(device)
+            outputs = model(images)
+            outputs = torch.relu(outputs)
+            for i in range(len(images)):
+                raw  = float(outputs[i].sum().item())
+                real = float(actual_counts[i].item())
+                if raw > 0 and real > 0:
+                    ratios.append(real / raw)
+    scale = float(np.median(ratios)) if ratios else 5.1
+    print(f"  Scale factor computed : {scale:.4f}")
+    return scale
+
+
+def validate(model, dataloader, scale_factor):
     model.eval()
     criterion  = nn.MSELoss()
     total_loss = 0.0
     total_mae  = 0.0
+    total_rmse = 0.0
     results    = []
 
-    print("\n" + "="*50)
-    print("  VALIDATION")
-    print("="*50 + "\n")
+    print("\n" + "="*55)
+    print("  VALIDATION  –  Real Crowd Count")
+    print("="*55 + "\n")
 
     with torch.no_grad():
-        for images, targets, paths in dataloader:
+        for images, targets, actual_counts, paths in dataloader:
             images  = images.to(device)
             targets = targets.to(device)
             outputs = model(images)
@@ -130,57 +153,106 @@ def validate(model, dataloader):
                     outputs, size=targets.shape[2:],
                     mode="bilinear", align_corners=False,
                 )
+            outputs_relu = torch.relu(outputs)
             loss         = criterion(outputs, targets)
-            pred_count   = outputs.sum().item() / 64
-            target_count = targets.sum().item() / 64
-            mae          = abs(pred_count - target_count)
-            total_loss  += loss.item()
-            total_mae   += mae
-            results.append({
-                "path"   : paths[0],
-                "pred"   : pred_count,
-                "actual" : target_count,
-                "mae"    : mae,
-            })
+
+            for i in range(len(images)):
+                raw_sum      = float(outputs_relu[i].sum().item())
+                pred_count   = raw_sum * scale_factor
+                actual_count = float(actual_counts[i].item())
+                mae          = abs(pred_count - actual_count)
+                mse          = (pred_count - actual_count) ** 2
+
+                total_mae  += mae
+                total_rmse += mse
+                results.append({
+                    "path"   : paths[i],
+                    "pred"   : pred_count,
+                    "actual" : actual_count,
+                    "mae"    : mae,
+                })
+
+            total_loss += loss.item()
 
     avg_loss = total_loss / len(dataloader)
-    avg_mae  = total_mae  / len(dataloader)
+    avg_mae  = total_mae  / len(results)
+    avg_rmse = (total_rmse / len(results)) ** 0.5
 
-    print(f"  Val Loss (MSE) : {avg_loss:.4f}")
-    print(f"  Val MAE        : {avg_mae:.2f}")
-    print(f"  Total images   : {len(results)}")
+    print(f"  Total images      : {len(results)}")
+    print(f"  Val Loss (MSE)    : {avg_loss:.4f}")
+    print(f"  Val MAE           : {avg_mae:.2f} people")
+    print(f"  Val RMSE          : {avg_rmse:.2f} people")
+    print(f"  Scale factor used : {scale_factor:.4f}")
+
+    # ── print per image results ───────────────────────────────
+    print(f"\n  {'Image':<15}  {'Actual':>8}  {'Predicted':>10}  {'MAE':>8}")
+    print(f"  {'-'*15}  {'-'*8}  {'-'*10}  {'-'*8}")
+    for r in results[:20]:  # show first 20
+        print(f"  {Path(r['path']).name:<15}  "
+              f"{r['actual']:>8.0f}  "
+              f"{r['pred']:>10.0f}  "
+              f"{r['mae']:>8.1f}")
+    if len(results) > 20:
+        print(f"  ... and {len(results)-20} more images")
 
     preds   = [r["pred"]   for r in results]
     actuals = [r["actual"] for r in results]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    # ── plot ──────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # scatter pred vs actual
     axes[0].scatter(actuals, preds, alpha=0.5, color="#7c6af7", s=20)
     max_val = max(max(actuals), max(preds)) if actuals else 100
     axes[0].plot([0, max_val], [0, max_val], "r--", lw=2,
                  label="Perfect prediction")
-    axes[0].set_xlabel("Actual Count")
-    axes[0].set_ylabel("Predicted Count")
-    axes[0].set_title(f"Val  –  Pred vs Actual  (MAE={avg_mae:.1f})")
+    axes[0].set_xlabel("Actual Crowd Count")
+    axes[0].set_ylabel("Predicted Crowd Count")
+    axes[0].set_title(f"Pred vs Actual\nMAE = {avg_mae:.1f} people")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
+    # error distribution
     errors = [r["mae"] for r in results]
     axes[1].hist(errors, bins=20, color="#22d3ee",
                  edgecolor="black", alpha=0.8)
-    axes[1].set_xlabel("MAE per image")
-    axes[1].set_ylabel("Count")
-    axes[1].set_title(f"Error Distribution (Avg MAE={avg_mae:.1f})")
+    axes[1].set_xlabel("MAE per image (people)")
+    axes[1].set_ylabel("Number of images")
+    axes[1].set_title(f"Error Distribution\nAvg MAE = {avg_mae:.1f} people")
     axes[1].grid(True, alpha=0.3)
 
-    plt.suptitle("Validation Results", fontsize=12, fontweight="bold")
+    # actual vs predicted bar for first 15 images
+    n    = min(15, len(results))
+    idxs = range(n)
+    bar_actual = [results[i]["actual"] for i in idxs]
+    bar_pred   = [results[i]["pred"]   for i in idxs]
+    labels     = [Path(results[i]["path"]).stem for i in idxs]
+    x = np.arange(n)
+    w = 0.35
+    axes[2].bar(x - w/2, bar_actual, w, label="Actual",
+                color="#4ade80", alpha=0.8)
+    axes[2].bar(x + w/2, bar_pred,   w, label="Predicted",
+                color="#f97316", alpha=0.8)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    axes[2].set_ylabel("Crowd Count")
+    axes[2].set_title("Actual vs Predicted (first 15 images)")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle(
+        f"Validation Results  –  MAE: {avg_mae:.1f}  RMSE: {avg_rmse:.1f}  "
+        f"({len(results)} images)",
+        fontsize=12, fontweight="bold"
+    )
     plt.tight_layout()
     out = Path(OUTPUT_DIR)
     out.mkdir(parents=True, exist_ok=True)
     save_path = out / "validation_results.png"
-    plt.savefig(save_path, dpi=150)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     print(f"\n  Plot saved → {save_path}\n")
-    return avg_loss, avg_mae
+    return avg_loss, avg_mae, avg_rmse
 
 
 if __name__ == "__main__":
@@ -209,11 +281,15 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(model_path, map_location=device))
     print(f"  Model loaded → {model_path}")
 
-    print("\n[ STEP 3 ]  Running Validation...")
-    avg_loss, avg_mae = validate(model, dataloader)
+    print("\n[ STEP 3 ]  Computing Scale Factor...")
+    scale = compute_scale_factor(model, dataloader)
 
-    print("="*50)
+    print("\n[ STEP 4 ]  Running Validation...")
+    avg_loss, avg_mae, avg_rmse = validate(model, dataloader, scale)
+
+    print("="*55)
     print("  VALIDATION COMPLETE!")
-    print(f"  Final MAE  : {avg_mae:.2f}")
-    print(f"  Final Loss : {avg_loss:.4f}")
-    print("="*50 + "\n")
+    print(f"  MAE  : {avg_mae:.2f} people")
+    print(f"  RMSE : {avg_rmse:.2f} people")
+    print(f"  Loss : {avg_loss:.4f}")
+    print("="*55 + "\n")

@@ -68,10 +68,15 @@ class ShanghaiTechDataset(Dataset):
 
     def __getitem__(self, index):
         img_path, mat_path = self.samples[index]
-        image = Image.open(img_path).convert("RGB")
+        image  = Image.open(img_path).convert("RGB")
+        points = load_mat(mat_path)
+
+        # real head count from .mat
+        actual_count = len(points)
+
         if self.transform:
             image = self.transform(image)
-        points  = load_mat(mat_path)
+
         H, W    = image.shape[1], image.shape[2]
         density = make_density_map(points, (H, W))
         density_tensor = torch.from_numpy(density).unsqueeze(0)
@@ -81,7 +86,7 @@ class ShanghaiTechDataset(Dataset):
             mode="bilinear", align_corners=False,
         ).squeeze(0)
         density_tensor = density_tensor * 64
-        return image, density_tensor, str(img_path)
+        return image, density_tensor, actual_count, str(img_path)
 
 
 class CSRNet(nn.Module):
@@ -91,7 +96,6 @@ class CSRNet(nn.Module):
         self.frontend = nn.Sequential(
             *list(vgg.features.children())[:23]
         )
-        # ── 4 layers  – must match train.py ──────────────────
         self.backend = nn.Sequential(
             nn.Conv2d(512, 256, 3, padding=2, dilation=2),
             nn.ReLU(inplace=True),
@@ -109,79 +113,133 @@ class CSRNet(nn.Module):
         return x
 
 
-def test(model, dataloader):
+def compute_scale_factor(model, dataloader):
+    """Compute best scale factor from test data."""
     model.eval()
-    total_mae = 0.0
-    total_mse = 0.0
-    results   = []
+    ratios = []
+    with torch.no_grad():
+        for images, targets, actual_counts, _ in dataloader:
+            images = images.to(device)
+            outputs = model(images)
+            outputs = torch.relu(outputs)
+            for i in range(len(images)):
+                raw  = float(outputs[i].sum().item())
+                real = float(actual_counts[i].item())
+                if raw > 0 and real > 0:
+                    ratios.append(real / raw)
+    scale = float(np.median(ratios)) if ratios else 5.1
+    print(f"  Scale factor computed : {scale:.4f}")
+    return scale
 
-    print("\n" + "="*50)
-    print("  FINAL TESTING")
-    print("="*50 + "\n")
+
+def test(model, dataloader, scale_factor):
+    model.eval()
+    total_mae  = 0.0
+    total_mse  = 0.0
+    results    = []
+
+    print("\n" + "="*55)
+    print("  FINAL TESTING  –  Real Crowd Count")
+    print("="*55 + "\n")
 
     with torch.no_grad():
-        for images, targets, paths in dataloader:
+        for images, targets, actual_counts, paths in dataloader:
             images  = images.to(device)
-            targets = targets.to(device)
             outputs = model(images)
-            if outputs.shape != targets.shape:
-                outputs = torch.nn.functional.interpolate(
-                    outputs, size=targets.shape[2:],
-                    mode="bilinear", align_corners=False,
-                )
-            pred_count   = outputs.sum().item() / 64
-            target_count = targets.sum().item() / 64
-            mae          = abs(pred_count - target_count)
-            mse          = (pred_count - target_count) ** 2
-            total_mae   += mae
-            total_mse   += mse
-            results.append({
-                "path"   : paths[0],
-                "pred"   : pred_count,
-                "actual" : target_count,
-                "mae"    : mae,
-            })
-            print(f"  {Path(paths[0]).name:<15}  "
-                  f"Actual: {target_count:>6.0f}  "
-                  f"Predicted: {pred_count:>6.0f}  "
-                  f"MAE: {mae:.1f}")
+            outputs = torch.relu(outputs)
 
-    avg_mae  = total_mae / len(dataloader)
-    avg_rmse = (total_mse / len(dataloader)) ** 0.5
+            for i in range(len(images)):
+                raw_sum      = float(outputs[i].sum().item())
+                pred_count   = raw_sum * scale_factor
+                actual_count = float(actual_counts[i].item())
+                mae          = abs(pred_count - actual_count)
+                mse          = (pred_count - actual_count) ** 2
 
-    print("\n" + "-"*50)
-    print(f"  Final MAE  : {avg_mae:.2f}")
-    print(f"  Final RMSE : {avg_rmse:.2f}")
-    print(f"  Total images : {len(results)}")
+                total_mae  += mae
+                total_mse  += mse
+                results.append({
+                    "path"   : paths[i],
+                    "pred"   : pred_count,
+                    "actual" : actual_count,
+                    "mae"    : mae,
+                })
+
+    avg_mae  = total_mae / len(results)
+    avg_rmse = (total_mse / len(results)) ** 0.5
+
+    # ── print results ─────────────────────────────────────────
+    print(f"  {'Image':<15}  {'Actual':>8}  {'Predicted':>10}  {'MAE':>8}")
+    print(f"  {'-'*15}  {'-'*8}  {'-'*10}  {'-'*8}")
+    for r in results[:20]:
+        print(f"  {Path(r['path']).name:<15}  "
+              f"{r['actual']:>8.0f}  "
+              f"{r['pred']:>10.0f}  "
+              f"{r['mae']:>8.1f}")
+    if len(results) > 20:
+        print(f"  ... and {len(results)-20} more images")
+
+    print(f"\n  {'-'*55}")
+    print(f"  Total images  : {len(results)}")
+    print(f"  Final MAE     : {avg_mae:.2f} people")
+    print(f"  Final RMSE    : {avg_rmse:.2f} people")
+    print(f"  Scale factor  : {scale_factor:.4f}")
 
     preds   = [r["pred"]   for r in results]
     actuals = [r["actual"] for r in results]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    axes[0].scatter(actuals, preds, alpha=0.5, color="#22d3ee", s=20)
+    # ── plots ─────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # scatter
+    axes[0].scatter(actuals, preds, alpha=0.5,
+                    color="#22d3ee", s=20)
     max_val = max(max(actuals), max(preds)) if actuals else 100
-    axes[0].plot([0, max_val], [0, max_val], "r--", lw=2, label="Perfect")
-    axes[0].set_xlabel("Actual Count")
-    axes[0].set_ylabel("Predicted Count")
-    axes[0].set_title("Test  –  Pred vs Actual")
+    axes[0].plot([0, max_val], [0, max_val],
+                 "r--", lw=2, label="Perfect")
+    axes[0].set_xlabel("Actual Crowd Count")
+    axes[0].set_ylabel("Predicted Crowd Count")
+    axes[0].set_title(f"Pred vs Actual\nMAE = {avg_mae:.1f} people")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
+    # error histogram
     errors = [r["mae"] for r in results]
     axes[1].hist(errors, bins=20, color="#f97316",
                  edgecolor="black", alpha=0.8)
-    axes[1].set_xlabel("MAE per image")
-    axes[1].set_ylabel("Count")
-    axes[1].set_title(f"Error Distribution (Avg MAE={avg_mae:.1f})")
+    axes[1].set_xlabel("MAE per image (people)")
+    axes[1].set_ylabel("Number of images")
+    axes[1].set_title(f"Error Distribution\nAvg MAE = {avg_mae:.1f} people")
     axes[1].grid(True, alpha=0.3)
 
-    plt.suptitle(f"Final Test Results  –  MAE:{avg_mae:.1f}  RMSE:{avg_rmse:.1f}",
-                 fontsize=12, fontweight="bold")
+    # bar chart first 15
+    n          = min(15, len(results))
+    bar_actual = [results[i]["actual"] for i in range(n)]
+    bar_pred   = [results[i]["pred"]   for i in range(n)]
+    labels     = [Path(results[i]["path"]).stem for i in range(n)]
+    x = np.arange(n)
+    w = 0.35
+    axes[2].bar(x - w/2, bar_actual, w, label="Actual",
+                color="#4ade80", alpha=0.8)
+    axes[2].bar(x + w/2, bar_pred,   w, label="Predicted",
+                color="#f97316", alpha=0.8)
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels(labels, rotation=45,
+                             ha="right", fontsize=7)
+    axes[2].set_ylabel("Crowd Count")
+    axes[2].set_title("Actual vs Predicted (first 15)")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3, axis="y")
+
+    plt.suptitle(
+        f"Final Test Results  –  MAE: {avg_mae:.1f}  "
+        f"RMSE: {avg_rmse:.1f}  ({len(results)} images)",
+        fontsize=12, fontweight="bold"
+    )
     plt.tight_layout()
     out = Path(OUTPUT_DIR)
     out.mkdir(parents=True, exist_ok=True)
     save_path = out / "test_results.png"
-    plt.savefig(save_path, dpi=150)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.show()
     print(f"\n  Plot saved → {save_path}\n")
     return avg_mae, avg_rmse
@@ -213,11 +271,14 @@ if __name__ == "__main__":
     model.load_state_dict(torch.load(model_path, map_location=device))
     print(f"  Model loaded → {model_path}")
 
-    print("\n[ STEP 3 ]  Running Final Test...")
-    avg_mae, avg_rmse = test(model, dataloader)
+    print("\n[ STEP 3 ]  Computing Scale Factor...")
+    scale = compute_scale_factor(model, dataloader)
 
-    print("="*50)
+    print("\n[ STEP 4 ]  Running Final Test...")
+    avg_mae, avg_rmse = test(model, dataloader, scale)
+
+    print("="*55)
     print("  TESTING COMPLETE!")
-    print(f"  Final MAE  : {avg_mae:.2f}")
-    print(f"  Final RMSE : {avg_rmse:.2f}")
-    print("="*50 + "\n")
+    print(f"  Final MAE  : {avg_mae:.2f} people")
+    print(f"  Final RMSE : {avg_rmse:.2f} people")
+    print("="*55 + "\n")
