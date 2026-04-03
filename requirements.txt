@@ -1,9 +1,0 @@
-torch
-torchvision
-torchaudio
-opencv-python
-numpy
-pillow
-matplotlib
-tqdm
-scipy
