@@ -2,14 +2,12 @@
 #  scripts/video_predict.py
 #
 #  Standalone video crowd counting pipeline using CSRNet.
-#  Optionally cross-validates with YOLO-CROWD for uncertainty detection.
 #
 #  Usage:
 #    python scripts/video_predict.py --video path/to/video.mp4
 #    python scripts/video_predict.py --video path/to/video.mp4 --show-density
 #    python scripts/video_predict.py --video path/to/video.mp4 --save
 #    python scripts/video_predict.py --video path/to/video.mp4 --model best --skip 3
-#    python scripts/video_predict.py --video path/to/video.mp4 --yolo models/yolo_crowd.pt
 # ============================================================
 
 import sys
@@ -23,14 +21,6 @@ import torch.nn as nn
 from torchvision import models
 from PIL import Image
 import cv2
-
-# ── YOLO-CROWD (optional cross-validation) ───────────────────────────────────
-try:
-    import yolov5
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("  [INFO] yolov5 not installed — YOLO cross-check disabled")
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "src"))
 from config import MODEL_DIR, OUTPUT_DIR, DATA_ROOT
@@ -82,7 +72,7 @@ class CSRNetPretrained(nn.Module):
         return self.output_layer(x)
 
 
-# ── Model Loaders ─────────────────────────────────────────────────────────────
+# ── Model Loader ─────────────────────────────────────────────────────────────
 
 def load_model(checkpoint_path):
     """Auto-detects architecture from checkpoint and loads weights."""
@@ -123,22 +113,6 @@ def load_model(checkpoint_path):
             print(f"  Missing keys       : {result.missing_keys}")
 
     return model
-
-
-def load_yolo_model(weights_path):
-    """Load YOLO-CROWD model for cross-validation."""
-    if not YOLO_AVAILABLE:
-        return None
-    try:
-        model = yolov5.load(str(weights_path))
-        model.conf    = 0.25   # confidence threshold
-        model.iou     = 0.45   # NMS IoU threshold
-        model.max_det = 1000
-        print(f"  YOLO-CROWD loaded  : {weights_path}")
-        return model
-    except Exception as e:
-        print(f"  [WARN] YOLO load failed: {e}")
-        return None
 
 
 # ── Image Helpers ─────────────────────────────────────────────────────────────
@@ -208,6 +182,7 @@ def compute_scale_factor(model):
     Uses patch-based inference — consistent with video inference.
     """
     import scipy.io as sio
+    from scipy.ndimage import gaussian_filter
 
     def load_gt(img_path):
         try:
@@ -265,9 +240,8 @@ def compute_scale_factor(model):
 
 # ── HUD Drawing ──────────────────────────────────────────────────────────────
 
-def draw_hud(frame, count, fps, frame_idx, total_frames,
-             alert_threshold=300, uncertain=False):
-    """Draws count, FPS, progress bar, alert banner, and uncertainty flag onto frame."""
+def draw_hud(frame, count, fps, frame_idx, total_frames, alert_threshold=300):
+    """Draws count, FPS, progress bar and alert banner onto frame."""
     h, w = frame.shape[:2]
 
     # Top dark bar
@@ -304,12 +278,6 @@ def draw_hud(frame, count, fps, frame_idx, total_frames,
         cv2.rectangle(frame, (0, h - 6), (w, h),     (40, 40, 40),  -1)
         cv2.rectangle(frame, (0, h - 6), (bar_w, h), (0, 200, 100), -1)
 
-    # Uncertainty warning (bottom-left, orange)
-    if uncertain:
-        cv2.putText(frame, "? COUNT UNCERTAIN",
-                    (15, h - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 1, cv2.LINE_AA)
-
     return frame
 
 
@@ -317,8 +285,7 @@ def draw_hud(frame, count, fps, frame_idx, total_frames,
 
 def video_predict(model, scale_factor, video_path,
                   save_output=False, frame_skip=2,
-                  show_density=False, alert_threshold=300,
-                  yolo_model=None):
+                  show_density=False, alert_threshold=300):
     """
     Full video crowd-counting pipeline.
 
@@ -330,7 +297,6 @@ def video_predict(model, scale_factor, video_path,
         frame_skip     : run model every N frames (default 2 = 2x faster)
         show_density   : if True, shows density heatmap side-by-side
         alert_threshold: crowd count above which ALERT banner fires
-        yolo_model     : optional YOLO-CROWD model for cross-validation
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -351,7 +317,6 @@ def video_predict(model, scale_factor, video_path,
     print(f"  Processing     : every {frame_skip} frame(s)")
     print(f"  Density overlay: {'ON' if show_density else 'OFF'}")
     print(f"  Alert at count : {alert_threshold}+ people")
-    print(f"  YOLO cross-check: {'ON' if yolo_model is not None else 'OFF'}")
     print(f"  Save output    : {'YES' if save_output else 'NO'}")
     print(f"  {'='*50}")
     print(f"  Press  Q  to quit at any time\n")
@@ -379,7 +344,6 @@ def video_predict(model, scale_factor, video_path,
     count_history = []
     fps_display   = 0.0
     t_prev        = time.time()
-    uncertain     = False
 
     # ── Main Loop ────────────────────────────────────────────────────
     while True:
@@ -395,28 +359,12 @@ def video_predict(model, scale_factor, video_path,
             pil_img = Image.fromarray(rgb)
             pil_img = resize_keep_aspect(pil_img, max_size=1024)
 
-            # CSRNet inference
             raw_density  = predict_patches(model, pil_img)
             raw_count    = float(raw_density.sum())
             last_count   = float(np.clip(raw_count * scale_factor, 0, 5000))
             last_density = raw_density
-
-            # ── YOLO-CROWD cross-check ────────────────────────────────
-            uncertain = False
-            if yolo_model is not None:
-                try:
-                    yolo_results = yolo_model(frame)
-                    yolo_count   = len(yolo_results.pred[0])
-                    divergence   = abs(last_count - yolo_count) / max(last_count, 1)
-                    uncertain    = divergence > 0.20
-                    if uncertain:
-                        print(f"  [WARN] Frame {frame_idx}: CSRNet={last_count:.0f}, "
-                              f"YOLO={yolo_count} — divergence {divergence:.0%}")
-                except Exception:
-                    pass
-            # ─────────────────────────────────────────────────────────
-
             count_history.append(last_count)
+
             t_now       = time.time()
             fps_display = frame_skip / max(t_now - t_prev, 1e-6)
             t_prev      = t_now
@@ -443,8 +391,7 @@ def video_predict(model, scale_factor, video_path,
         # Draw HUD
         display = draw_hud(
             display, last_count, fps_display,
-            frame_idx, total_frames, alert_threshold,
-            uncertain=uncertain        # ← pass uncertainty flag
+            frame_idx, total_frames, alert_threshold
         )
 
         # Save frame
@@ -498,11 +445,9 @@ if __name__ == "__main__":
                         help="Crowd count threshold for alert banner (default: 300)")
     parser.add_argument("--scale",         type=float, default=None,
                         help="Override scale factor manually (skip auto-calibration)")
-    parser.add_argument("--yolo",          type=str,  default=None,
-                        help="Path to YOLO-CROWD weights (.pt) for cross-validation")
     args = parser.parse_args()
 
-    # ── STEP 1: Load CSRNet Model ────────────────────────────────────
+    # ── STEP 1: Load Model ───────────────────────────────────────────
     print("[ STEP 1 ]  Loading Model...")
     model_candidates = {
         "pretrained": Path(MODEL_DIR) / "csrnet_pretrained.pth",
@@ -528,14 +473,6 @@ if __name__ == "__main__":
     model = load_model(model_path)
     print(f"  Parameters     : {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── STEP 1b: Load YOLO-CROWD (optional) ─────────────────────────
-    yolo_model = None
-    if args.yolo:
-        print("\n[ STEP 1b ] Loading YOLO-CROWD...")
-        yolo_model = load_yolo_model(Path(args.yolo))
-    else:
-        print("\n[ STEP 1b ] YOLO cross-check skipped (no --yolo flag)")
-
     # ── STEP 2: Scale Factor ─────────────────────────────────────────
     print("\n[ STEP 2 ]  Scale Factor...")
     if args.scale is not None:
@@ -547,14 +484,13 @@ if __name__ == "__main__":
     # ── STEP 3: Run Video Pipeline ───────────────────────────────────
     print("\n[ STEP 3 ]  Starting Video Pipeline...")
     video_predict(
-        model           = model,
-        scale_factor    = scale,
-        video_path      = args.video,
-        save_output     = args.save,
-        frame_skip      = args.skip,
-        show_density    = args.show_density,
-        alert_threshold = args.alert,
-        yolo_model      = yolo_model,
+        model          = model,
+        scale_factor   = scale,
+        video_path     = args.video,
+        save_output    = args.save,
+        frame_skip     = args.skip,
+        show_density   = args.show_density,
+        alert_threshold= args.alert,
     )
 
     print("=" * 52)
