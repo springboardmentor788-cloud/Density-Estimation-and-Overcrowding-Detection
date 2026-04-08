@@ -30,16 +30,28 @@ def normalize_density_for_display(d: np.ndarray, percentile: float = 98.0) -> np
     return np.clip(out, 0.0, 1.0)
 
 
-def density_to_rgb(density_vis: np.ndarray) -> np.ndarray:
-    """
-    Map normalized density [0,1] to RGB: blue (low) -> green (mid) -> red (high).
-    Returns (H, W, 3) float in [0, 1].
-    """
-    d = np.clip(np.asarray(density_vis, dtype=np.float32), 0.0, 1.0)
-    r = np.where(d < 0.5, 0.0, 2.0 * (d - 0.5))
-    g = np.where(d < 0.5, 2.0 * d, 1.0)
-    b = np.where(d < 0.5, 1.0 - 2.0 * d, 0.0)
-    return np.stack([r, g, b], axis=-1).astype(np.float32)
+def sample_points_from_density(density: np.ndarray, num_points: int = None) -> np.ndarray:
+    """Sample points from density map. If num_points is None, sample approximately the total count."""
+    d = np.clip(density, 0, None)
+    total = d.sum()
+    if total <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if num_points is None:
+        num_points = int(np.round(total))
+    if num_points <= 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    
+    # Flatten and sample
+    flat_d = d.flatten()
+    probs = flat_d / flat_d.sum()
+    indices = np.random.choice(len(flat_d), size=num_points, p=probs)
+    
+    # Convert to coords
+    h, w = d.shape
+    y_coords = indices // w
+    x_coords = indices % w
+    points = np.stack([x_coords, y_coords], axis=1).astype(np.float32)
+    return points
 
 
 def overlay_density_on_image(
@@ -116,7 +128,7 @@ def main():
     model = model.to(device)
     model.eval()
 
-    imgs, gt_densities, gt_counts = next(iter(loader))
+    imgs, gt_densities, gt_counts, gt_points = next(iter(loader))
     imgs = imgs.to(device)
     with torch.no_grad():
         pred_densities = model(imgs)
@@ -173,30 +185,39 @@ def main():
         fig.suptitle("Crowd Density Estimation Results", fontsize=14, fontweight="bold", y=1.02)
         fig.text(0.5, 0.98, f"Predicted: {pred_count:.1f}, Ground Truth: {gt_count:.1f}, Error: {count_error:.1f}", ha="center", fontsize=11)
 
-        # Row 0: Original | Ground Truth Density | Predicted Density
+        # Row 0: Original | Ground Truth Points | Predicted Points
         axes[0, 0].imshow(img)
         axes[0, 0].set_title("Original Image")
         axes[0, 0].axis("off")
 
-        gt_d_norm = normalize_density_for_display(gt_d, percentile=98.0)
-        axes[0, 1].imshow(plt.cm.jet(gt_d_norm)[:, :, :3])
-        axes[0, 1].set_title(f"Ground Truth Density\nCount: {gt_count:.1f}")
+        axes[0, 1].imshow(img)
+        gt_pts = gt_points[idx]
+        if gt_pts.size > 0:
+            axes[0, 1].scatter(gt_pts[:, 0], gt_pts[:, 1], c='red', s=5, alpha=0.8)
+        axes[0, 1].set_title(f"Ground Truth Points\nCount: {gt_count:.1f}")
         axes[0, 1].axis("off")
 
-        pred_d_norm = normalize_density_for_display(pred_d, percentile=98.0)
-        axes[0, 2].imshow(plt.cm.jet(pred_d_norm)[:, :, :3])
-        axes[0, 2].set_title(f"Predicted Density\nCount: {pred_count:.1f}")
+        axes[0, 2].imshow(img)
+        pred_pts = sample_points_from_density(pred_d)
+        pred_pts *= 8  # scale to image coords
+        if pred_pts.size > 0:
+            axes[0, 2].scatter(pred_pts[:, 0], pred_pts[:, 1], c='blue', s=5, alpha=0.8)
+        axes[0, 2].set_title(f"Predicted Points\nCount: {pred_count:.1f}")
         axes[0, 2].axis("off")
 
-        # Row 1: GT Overlay | Pred Overlay | Absolute Error Map (jet colormap for visibility)
-        gt_overlay = overlay_density_on_image(img, gt_d, alpha=0.5, mask_style=True, use_jet=True, percentile=98.0)
-        axes[1, 0].imshow(gt_overlay)
-        axes[1, 0].set_title("GT Density Overlay")
+        # Row 1: GT Points Overlay | Pred Points Overlay | Absolute Error Map (jet colormap for visibility)
+        axes[1, 0].imshow(img)
+        if gt_pts.size > 0:
+            axes[1, 0].scatter(gt_pts[:, 0], gt_pts[:, 1], c='red', s=5, alpha=0.8)
+        axes[1, 0].set_title("GT Points Overlay")
         axes[1, 0].axis("off")
 
-        pred_overlay = overlay_density_on_image(img, pred_d, alpha=0.5, mask_style=True, use_jet=True, percentile=98.0)
-        axes[1, 1].imshow(pred_overlay)
-        axes[1, 1].set_title("Predicted Density Overlay")
+        axes[1, 1].imshow(img)
+        pred_pts = sample_points_from_density(pred_d)
+        pred_pts *= 8  # scale to image coords
+        if pred_pts.size > 0:
+            axes[1, 1].scatter(pred_pts[:, 0], pred_pts[:, 1], c='blue', s=5, alpha=0.8)
+        axes[1, 1].set_title("Predicted Points Overlay")
         axes[1, 1].axis("off")
 
         # Absolute error map: |predicted density - ground truth density| (same shape, same scale)

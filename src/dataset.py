@@ -217,11 +217,15 @@ class ShanghaiTechDensityDataset(Dataset):
         # Load points and scale to density map resolution (1/8)
         if gt_path.exists():
             points = load_shanghaitech_points(gt_path)
+            # Scale points to resized image coords
+            scale_x = self.target_size[0] / orig_w
+            scale_y = self.target_size[1] / orig_h
+            orig_points = points * [scale_x, scale_y]
             # Scale from original image coords to density map coords
-            scale_x = self.density_w / orig_w
-            scale_y = self.density_h / orig_h
-            points[:, 0] *= scale_x
-            points[:, 1] *= scale_y
+            density_scale_x = self.density_w / orig_w
+            density_scale_y = self.density_h / orig_h
+            points[:, 0] *= density_scale_x
+            points[:, 1] *= density_scale_y
             density = points_to_density_map_simple(
                 points, self.density_h, self.density_w, kernel_size=15, sigma=2.0
             )
@@ -229,12 +233,15 @@ class ShanghaiTechDensityDataset(Dataset):
         else:
             density = np.zeros((self.density_h, self.density_w), dtype=np.float32)
             count = 0.0
+            orig_points = np.zeros((0, 2), dtype=np.float64)
 
         if is_augmented:
             density = np.fliplr(density).copy()
+            # Flip points
+            orig_points[:, 0] = self.target_size[0] - orig_points[:, 0]
 
         density_tensor = torch.from_numpy(density).unsqueeze(0)  # (1, H, W)
-        return img_tensor, density_tensor, count
+        return img_tensor, density_tensor, count, orig_points
 
 
 __all__ = [
