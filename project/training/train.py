@@ -1,264 +1,276 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import random
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.nn.utils import clip_grad_norm_
-from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from tqdm import tqdm
+try:
+    import torch
+    from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
+except Exception:  # pragma: no cover
+    torch = None
+    DataLoader = object
+    ConcatDataset = object
+    WeightedRandomSampler = object
 
-from project.dataset.loader import create_dataloader
-from project.models.csrnet import CSRNet
-from project.models.mcnn import MCNN
-from project.training.validate import validate_epoch
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+from config import CONFIG
+from dataset.density_map import resize_density_tensor
+from dataset.loader import build_crowd_datasets
+from inference.utils import get_device
+from models.csrnet import CSRNet
+from training.validate import evaluate_model
+from utils.weight_loader import load_external_weights
+from dataset.density_map import load_points_from_mat_cached
 
 
-def build_model(name: str, use_batch_norm: bool) -> torch.nn.Module:
-    if name.lower() == "csrnet":
-        return CSRNet(load_pretrained_frontend=True, use_batch_norm=use_batch_norm)
-    if name.lower() == "mcnn":
-        return MCNN()
-    raise ValueError(f"Unsupported model: {name}")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train CSRNet for crowd counting")
+    parser.add_argument("--data-roots", nargs="+", default=[str(CONFIG.project_root / "part_A_final")])
+    parser.add_argument("--epochs", type=int, default=CONFIG.epochs)
+    parser.add_argument("--batch-size", type=int, default=CONFIG.batch_size)
+    parser.add_argument("--learning-rate", type=float, default=CONFIG.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=CONFIG.weight_decay)
+    parser.add_argument("--val-fraction", type=float, default=CONFIG.val_split)
+    parser.add_argument("--resize-height", type=int, default=CONFIG.image_size[0])
+    parser.add_argument("--resize-width", type=int, default=CONFIG.image_size[1])
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--num-workers", type=int, default=CONFIG.num_workers)
+    parser.add_argument("--checkpoint-dir", type=str, default=str(CONFIG.checkpoint_dir))
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--init-weights", type=str, default=None)
+    parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--train-random-crop", action="store_true")
+    parser.add_argument("--crop-height", type=int, default=CONFIG.crop_size[0] if CONFIG.crop_size else 256)
+    parser.add_argument("--crop-width", type=int, default=CONFIG.crop_size[1] if CONFIG.crop_size else 256)
+    parser.add_argument("--save-examples-dir", type=str, default=None)
+    parser.add_argument("--scheduler-patience", type=int, default=8)
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--scheduler-min-lr", type=float, default=1e-7)
+    parser.add_argument("--count-loss-weight", type=float, default=CONFIG.count_loss_weight)
+    parser.add_argument("--count-loss-weight-max", type=float, default=CONFIG.count_loss_weight_max)
+    parser.add_argument("--dense-oversample", action="store_true")
+    parser.add_argument("--dense-threshold", type=float, default=700.0)
+    parser.add_argument("--dense-weight", type=float, default=4.0)
+    return parser
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train CSRNet/MCNN for crowd counting.")
-    parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--part", choices=["A", "B"], default="A")
-
-    parser.add_argument("--model", choices=["csrnet", "mcnn"], default="csrnet")
-    parser.add_argument("--batch-norm", action="store_true")
-
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
-    parser.add_argument("--amp", action="store_true")
-
-    parser.add_argument("--max-dim", type=int, default=1536)
-    parser.add_argument("--crop-size", type=int, default=512)
-    parser.add_argument("--output-stride", type=int, default=8)
-
-    parser.add_argument("--cache-dir", type=Path, default=Path("project/data/cache"))
-    parser.add_argument("--work-dir", type=Path, default=Path("project/data/runs"))
-    parser.add_argument("--exp-name", type=str, default="csrnet_exp")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--resume", type=Path, default=None)
-    return parser.parse_args()
+def _sample_count_from_item(item: object) -> float:
+    mat_path = item.mat_path if hasattr(item, "mat_path") else None
+    if mat_path is None:
+        return 0.0
+    pts = load_points_from_mat_cached(str(mat_path))
+    return float(pts.shape[0])
 
 
-def save_training_curves(history: dict, out_dir: Path) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    plt.figure(figsize=(8, 4))
-    plt.plot(history["epoch"], history["train_loss"], label="train_loss")
-    plt.plot(history["epoch"], history["val_loss"], label="val_loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("MSE Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "loss_curve.png", dpi=160)
-    plt.close()
-
-    plt.figure(figsize=(8, 4))
-    plt.plot(history["epoch"], history["val_mae"], label="val_mae")
-    plt.plot(history["epoch"], history["val_rmse"], label="val_rmse")
-    plt.xlabel("Epoch")
-    plt.ylabel("Count Error")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "metrics_curve.png", dpi=160)
-    plt.close()
-
-    plt.figure(figsize=(8, 4))
-    plt.plot(history["epoch"], history["val_r2"], label="val_r2")
-    plt.xlabel("Epoch")
-    plt.ylabel("R2")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_dir / "r2_curve.png", dpi=160)
-    plt.close()
+def _build_sample_weights(train_dataset: object, threshold: float, dense_weight: float) -> list[float]:
+    weights: list[float] = []
+    if isinstance(train_dataset, ConcatDataset):
+        for sub_ds in train_dataset.datasets:
+            sub_items = getattr(sub_ds, "samples", [])
+            for item in sub_items:
+                cnt = _sample_count_from_item(item)
+                weights.append(dense_weight if cnt >= threshold else 1.0)
+    else:
+        items = getattr(train_dataset, "samples", [])
+        for item in items:
+            cnt = _sample_count_from_item(item)
+            weights.append(dense_weight if cnt >= threshold else 1.0)
+    if not weights:
+        weights = [1.0] * len(train_dataset)
+    return weights
 
 
-def append_csv(log_file: Path, row: dict) -> None:
-    write_header = not log_file.exists()
-    with log_file.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+def train_one_epoch(
+    model: CSRNet,
+    dataloader: DataLoader,
+    device: "torch.device",
+    optimizer: "torch.optim.Optimizer",
+    scaler: "torch.cuda.amp.GradScaler | None",
+    *,
+    grad_clip_norm: float,
+    use_amp: bool,
+    count_loss_weight: float,
+) -> float:
+    criterion = torch.nn.MSELoss()
+    model.train()
+    running_loss = 0.0
+    valid_batches = 0
+
+    for batch in dataloader:
+        images = batch["image"].to(device, non_blocking=True)
+        gt_density = batch["density"].to(device, non_blocking=True)
+        gt_count = batch["count"].to(device, non_blocking=True).float() if torch.is_tensor(batch["count"]) else torch.tensor(batch["count"], device=device).float()
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            pred_density = model(images)
+            target_density = resize_density_tensor(gt_density, pred_density.shape[-2:])
+            density_loss = criterion(pred_density, target_density)
+            pred_count = pred_density.flatten(1).sum(dim=1)
+            count_loss = criterion(pred_count, gt_count)
+            loss = density_loss + count_loss_weight * count_loss
+
+        if not torch.isfinite(loss):
+            continue
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer.step()
+
+        running_loss += float(loss.item())
+        valid_batches += 1
+
+    return running_loss / max(1, valid_batches)
+
+
+def save_checkpoint(
+    path: str | Path,
+    model: CSRNet,
+    optimizer: "torch.optim.Optimizer",
+    epoch: int,
+    metrics: dict[str, float],
+    *,
+    scheduler: "torch.optim.lr_scheduler.ReduceLROnPlateau | None" = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+        "config": {
+            "image_size": CONFIG.image_size,
+            "learning_rate": CONFIG.learning_rate,
+            "batch_size": CONFIG.batch_size,
+        },
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(payload, path)
 
 
 def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
+    args = build_arg_parser().parse_args()
+    CONFIG.ensure_dirs()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    exp_dir = args.work_dir / args.exp_name
-    ckpt_dir = exp_dir / "checkpoints"
-    vis_dir = exp_dir / "val_vis"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir.mkdir(parents=True, exist_ok=True)
-
-    train_loader = create_dataloader(
-        dataset_root=args.dataset_root,
-        part=args.part,
-        split="train",
-        cache_root=args.cache_dir,
-        batch_size=args.batch_size,
-        workers=args.workers,
-        max_dim=args.max_dim,
-        crop_size=args.crop_size,
-        output_stride=args.output_stride,
-        train=True,
-    )
-    val_loader = create_dataloader(
-        dataset_root=args.dataset_root,
-        part=args.part,
-        split="test",
-        cache_root=args.cache_dir,
-        batch_size=max(1, args.batch_size // 2),
-        workers=max(1, args.workers // 2),
-        max_dim=args.max_dim,
-        crop_size=args.crop_size,
-        output_stride=args.output_stride,
-        train=False,
+    device = get_device(prefer_cuda=args.device != "cpu") if args.device == "auto" else torch.device(args.device)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    train_dataset, val_dataset, _ = build_crowd_datasets(
+        args.data_roots,
+        val_fraction=args.val_fraction,
+        resize_to=(args.resize_height, args.resize_width),
+        crop_size=(args.crop_height, args.crop_width) if args.train_random_crop else None,
+        random_flip=True,
+        random_crop=args.train_random_crop,
+        use_cache=True,
+        sigma_scale=CONFIG.density_sigma_scale,
+        min_sigma=CONFIG.density_min_sigma,
+        knn=CONFIG.density_knn,
+        seed=CONFIG.random_seed,
+        max_samples=args.max_samples,
     )
 
-    model = build_model(args.model, args.batch_norm).to(device)
-    criterion = nn.MSELoss(reduction="mean")
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-7)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
-
-    start_epoch = 0
-    best_mae = float("inf")
-
-    if args.resume is not None and args.resume.exists():
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"], strict=True)
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-        scaler.load_state_dict(ckpt["scaler"])
-        start_epoch = int(ckpt["epoch"]) + 1
-        best_mae = float(ckpt.get("best_mae", best_mae))
-        print(f"Resumed from {args.resume} at epoch {start_epoch}")
-
-    history = {
-        "epoch": [],
-        "train_loss": [],
-        "val_loss": [],
-        "val_mae": [],
-        "val_rmse": [],
-        "val_r2": [],
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
     }
-    log_file = exp_dir / "metrics.csv"
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    train_sampler = None
+    if args.dense_oversample:
+        sample_weights = _build_sample_weights(train_dataset, args.dense_threshold, args.dense_weight)
+        train_sampler = WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), num_samples=len(sample_weights), replacement=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        **loader_kwargs,
+    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-        epoch_loss = 0.0
+    model = CSRNet(pretrained=True)
+    model.to(device)
 
-        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
-        for batch in progress:
-            images = batch["image"].to(device, non_blocking=True)
-            gt_density = batch["density"].to(device, non_blocking=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.scheduler_factor,
+        patience=args.scheduler_patience,
+        min_lr=args.scheduler_min_lr,
+    )
+    use_amp = CONFIG.use_amp and (not args.no_amp) and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.amp.autocast("cuda", enabled=args.amp and device.type == "cuda"):
-                pred_density = model(images)
-                loss = criterion(pred_density, gt_density)
-
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
-            scaler.step(optimizer)
-            scaler.update()
-
-            epoch_loss += loss.item() * images.size(0)
-            progress.set_postfix(loss=f"{loss.item():.5f}", lr=f"{optimizer.param_groups[0]['lr']:.2e}")
-
-        train_loss = epoch_loss / max(1, len(train_loader.dataset))
-
-        val_metrics = validate_epoch(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            device=device,
-            use_amp=args.amp,
-            vis_dir=vis_dir if (epoch + 1) % 10 == 0 else None,
-            max_visualizations=6,
+    start_epoch = 1
+    best_mae = float("inf")
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+            optimizer.load_state_dict(checkpoint.get("optimizer_state_dict", optimizer.state_dict()))
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = int(checkpoint.get("epoch", 0)) + 1
+            best_mae = float(checkpoint.get("metrics", {}).get("mae", best_mae))
+    elif args.init_weights is not None:
+        missing, unexpected = load_external_weights(model, args.init_weights, map_location=device)
+        print(
+            f"Initialized from external weights: {args.init_weights} | missing={len(missing)} | unexpected={len(unexpected)}"
         )
 
-        scheduler.step(val_metrics["mae"])
+    for group in optimizer.param_groups:
+        group["lr"] = args.learning_rate
+        group["weight_decay"] = args.weight_decay
 
-        is_best = val_metrics["mae"] < best_mae
-        best_mae = min(best_mae, val_metrics["mae"])
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    best_path = checkpoint_dir / "csrnet_best.pth"
+    last_path = checkpoint_dir / "csrnet_last.pth"
 
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "best_mae": best_mae,
-            "args": {
-                k: (str(v) if isinstance(v, Path) else v)
-                for k, v in vars(args).items()
-            },
-        }
+    for epoch in range(start_epoch, args.epochs + 1):
+        if args.epochs <= start_epoch:
+            count_loss_weight = args.count_loss_weight_max
+        else:
+            ratio = (epoch - start_epoch) / max(1, (args.epochs - start_epoch))
+            count_loss_weight = args.count_loss_weight + ratio * (args.count_loss_weight_max - args.count_loss_weight)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            device,
+            optimizer,
+            scaler,
+            grad_clip_norm=CONFIG.grad_clip_norm,
+            use_amp=use_amp,
+            count_loss_weight=count_loss_weight,
+        )
+        metrics = evaluate_model(model, val_loader, device, save_examples_dir=args.save_examples_dir if epoch == args.epochs else None)
+        metrics["train_loss"] = train_loss
+        metrics["count_loss_weight"] = float(count_loss_weight)
 
-        torch.save(ckpt, ckpt_dir / "last.pt")
-        if is_best:
-            torch.save(ckpt, ckpt_dir / "best.pt")
+        scheduler.step(metrics["mae"])
+        metrics["lr"] = float(optimizer.param_groups[0]["lr"])
 
-        row = {
-            "epoch": epoch + 1,
-            "lr": optimizer.param_groups[0]["lr"],
-            "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
-            "val_mae": val_metrics["mae"],
-            "val_rmse": val_metrics["rmse"],
-            "val_r2": val_metrics["r2"],
-            "best_mae": best_mae,
-        }
-        append_csv(log_file, row)
-
-        history["epoch"].append(epoch + 1)
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_metrics["loss"])
-        history["val_mae"].append(val_metrics["mae"])
-        history["val_rmse"].append(val_metrics["rmse"])
-        history["val_r2"].append(val_metrics["r2"])
+        save_checkpoint(last_path, model, optimizer, epoch, metrics, scheduler=scheduler)
+        if metrics["mae"] < best_mae:
+            best_mae = metrics["mae"]
+            save_checkpoint(best_path, model, optimizer, epoch, metrics, scheduler=scheduler)
 
         print(
-            f"Epoch {epoch + 1:03d} | "
-            f"TrainLoss {train_loss:.6f} | "
-            f"ValLoss {val_metrics['loss']:.6f} | "
-            f"MAE {val_metrics['mae']:.4f} | "
-            f"RMSE {val_metrics['rmse']:.4f} | "
-            f"R2 {val_metrics['r2']:.4f} | "
-            f"BestMAE {best_mae:.4f}"
+            f"Epoch {epoch:03d} | Train Loss {train_loss:.6f} | Val Loss {metrics['val_loss']:.6f} | MAE {metrics['mae']:.3f} | RMSE {metrics['rmse']:.3f} | Bias {metrics['bias_mean']:.2f} | LR {metrics['lr']:.2e}"
         )
 
-    save_training_curves(history, exp_dir)
-    print(f"Training complete. Artifacts at: {exp_dir}")
+    print(f"Best validation MAE: {best_mae:.3f}")
 
 
 if __name__ == "__main__":

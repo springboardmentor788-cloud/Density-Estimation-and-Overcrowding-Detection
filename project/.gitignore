@@ -1,0 +1,68 @@
+# ---------- OS / editor ----------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ---------- Node / frontend ----------
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+frontend/.eslintcache
+
+# ---------- Build / logs / temp ----------
+*.log
+logs/
+*.tmp
+*.temp
+tmp/
+.temp/
+
+# ---------- ML artifacts ----------
+cache/
+outputs/
+checkpoints/
+external_weights/
+
+# ---------- Data (large local datasets) ----------
+part_A_final/
+part_B_final/
+*.mat
+
+# ---------- Media artifacts (generated) ----------
+outputs/**/*.mp4
+outputs/**/*.avi
+outputs/**/*.mov
+outputs/**/*.mkv
+outputs/**/*.webm
+outputs/**/*.jpg
+outputs/**/*.jpeg
+outputs/**/*.png
+
+# Root demo media
+12269404_2320_1080_30fps.mp4
+
+# Keep project docs and source tracked
+!README.md
+!requirements.txt

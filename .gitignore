@@ -38,3 +38,77 @@ project/data/output/
 
 # Notebook noise
 .ipynb_checkpoints/
+
+
+
+
+
+
+# ---------- OS / editor ----------
+project/.DS_Store
+project/Thumbs.db
+project/.vscode/
+project/.idea/
+project/*.swp
+project/*.swo
+project/*~
+
+# ---------- Python ----------
+project/__pycache__/
+project/*.py[cod]
+project/*.pyo
+project/*.pyd
+project/*.so
+project/.python-version
+project/.pytest_cache/
+project/.mypy_cache/
+project/.ruff_cache/
+project/.ipynb_checkpoints/
+
+# Virtual environments
+project/.venv/
+project/venv/
+project/env/
+
+# ---------- Node / frontend ----------
+project/frontend/node_modules/
+project/frontend/dist/
+project/frontend/.vite/
+project/frontend/.cache/
+project/frontend/.eslintcache
+
+# ---------- Build / logs / temp ----------
+project/*.log
+project/logs/
+project/*.tmp
+project/*.temp
+project/tmp/
+project/.temp/
+
+# ---------- ML artifacts ----------
+project/cache/
+project/outputs/
+project/checkpoints/
+project/external_weights/
+
+# ---------- Data (large local datasets) ----------
+project/part_A_final/
+project/part_B_final/
+project/*.mat
+
+# ---------- Media artifacts (generated) ----------
+project/outputs/**/*.mp4
+project/outputs/**/*.avi
+project/outputs/**/*.mov
+project/outputs/**/*.mkv
+project/outputs/**/*.webm
+project/outputs/**/*.jpg
+project/outputs/**/*.jpeg
+project/outputs/**/*.png
+
+# Root demo media
+project/12269404_2320_1080_30fps.mp4
+
+# Keep project docs and source tracked
+!project/README.md
+!project/requirements.txt

@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/api/client.ts","./src/components/MediaCompare.tsx","./src/components/MetricCard.tsx","./src/data/mockData.ts","./src/hooks/useInference.ts","./src/hooks/useModels.ts","./src/hooks/useWebcam.ts"],"version":"5.9.3"}

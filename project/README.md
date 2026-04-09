@@ -1,224 +1,158 @@
-# DeepVision Crowd Monitor (Milestone 3)
+# DeepVision Crowd Monitor
 
-Production-grade crowd density estimation and overcrowding detection system built on CSRNet with a modular PyTorch architecture.
+Milestone 3 implementation for crowd counting and overcrowding detection using CSRNet.
 
-## Highlights
+## Features
 
-- Adaptive kNN Gaussian density maps from ShanghaiTech .mat annotations.
-- Strict count preservation in density generation and downsampling.
-- Density map caching for faster training and validation.
-- CSRNet (primary) and MCNN (optional swap-in) model support.
-- Stable training: AMP, gradient clipping, ReduceLROnPlateau, checkpointing.
-- Metrics: MAE (primary), RMSE, and R2.
-- Real-time pipeline: webcam/video, heatmap overlay, alerts, and FPS display.
+- ShanghaiTech-style dataset loading for `part_A_final` and `part_B_final`
+- Adaptive Gaussian density map generation with count-preserving kernels
+- CSRNet crowd counting model in PyTorch
+- Training and validation pipeline with MAE and RMSE reporting
+- Image, video, and webcam inference with heatmap overlays
+- Overcrowding alerts with a configurable threshold
 
-## Project Structure
+## Dependencies
 
-```
-project/
-├── data/
-├── models/
-│   ├── csrnet.py
-│   └── mcnn.py
-├── dataset/
-│   ├── build_cache.py
-│   ├── density_map.py
-│   └── loader.py
-├── training/
-│   ├── evaluate.py
-│   ├── train.py
-│   └── validate.py
-├── inference/
-│   ├── benchmark.py
-│   ├── realtime.py
-│   └── utils.py
-├── utils/
-│   ├── metrics.py
-│   └── visualization.py
-├── config.py
-└── requirements.txt
-```
-
-## Dataset
-
-Expected layout in workspace root:
-
-```
-part_A_final/
-part_B_final/
-```
-
-Each part must contain:
-
-- train_data/images
-- train_data/ground_truth
-- test_data/images
-- test_data/ground_truth
-
-Ground-truth files must be .mat files in ShanghaiTech format.
-
-## Setup
-
-From workspace root:
+Install the runtime dependencies:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r project/requirements.txt
+pip install -r requirements.txt
 ```
 
-## 1) Build Density Cache (Recommended)
+## Training
+
+Train on Part A:
 
 ```bash
-python -m project.dataset.build_cache \
-	--dataset-root . \
-	--parts A B \
-	--splits train test \
-	--cache-dir project/data/cache \
-	--max-dim 1536 \
-	--output-stride 8
+python -m training.train \
+  --data-roots part_A_final \
+  --epochs 50 \
+  --batch-size 8 \
+  --learning-rate 1e-5 \
+  --resize-height 384 \
+  --resize-width 384 \
+  --train-random-crop
 ```
 
-## 2) Train
-
-Part A:
+Train on both Part A and Part B:
 
 ```bash
-python -m project.training.train \
-	--dataset-root . \
-	--part A \
-	--model csrnet \
-	--epochs 300 \
-	--batch-size 4 \
-	--workers 8 \
-	--lr 1e-5 \
-	--amp \
-	--cache-dir project/data/cache \
-	--work-dir project/data/runs \
-	--exp-name csrnet_partA
+python -m training.train \
+  --data-roots part_A_final part_B_final \
+  --epochs 50 \
+  --batch-size 8 \
+  --learning-rate 1e-5 \
+  --resize-height 384 \
+  --resize-width 384 \
+  --train-random-crop
 ```
 
-Part B:
+The best checkpoint is saved to `checkpoints/csrnet_best.pth`.
+
+## Validation
 
 ```bash
-python -m project.training.train \
-	--dataset-root . \
-	--part B \
-	--model csrnet \
-	--epochs 300 \
-	--batch-size 8 \
-	--workers 8 \
-	--lr 1e-5 \
-	--amp \
-	--cache-dir project/data/cache \
-	--work-dir project/data/runs \
-	--exp-name csrnet_partB
+python -m training.validate \
+  --data-roots part_A_final \
+  --checkpoint checkpoints/csrnet_best.pth \
+  --save-examples-dir outputs/validation_examples
 ```
 
-Training outputs:
+## Image Inference
 
-- checkpoints: `project/data/runs/<exp-name>/checkpoints/{last.pt,best.pt}`
-- logs: `project/data/runs/<exp-name>/metrics.csv`
-- curves: `project/data/runs/<exp-name>/{loss_curve.png,metrics_curve.png,r2_curve.png}`
-
-## 3) Evaluate
+Single image:
 
 ```bash
-python -m project.training.evaluate \
-	--dataset-root . \
-	--part A \
-	--split test \
-	--model csrnet \
-	--checkpoint project/data/runs/csrnet_partA/checkpoints/best.pt \
-	--batch-size 2 \
-	--workers 4 \
-	--cache-dir project/data/cache \
-	--vis-dir project/data/eval_vis/partA \
-	--report-dir project/data/eval_reports
+python -m inference.image_inference \
+  --input test.jpg \
+  --checkpoint checkpoints/csrnet_best.pth \
+  --output-dir outputs/image_inference
 ```
 
-Evaluation artifacts are automatically exported to:
-
-- `project/data/eval_reports/<run_name>/summary.json`
-- `project/data/eval_reports/<run_name>/per_image_metrics.csv`
-- `project/data/eval_reports/<run_name>/counts_scatter_gt_vs_pred.png`
-- `project/data/eval_reports/<run_name>/counts_residual_hist.png`
-- `project/data/eval_reports/<run_name>/counts_evaluation_matrix.png`
-- `project/data/eval_reports/<run_name>/metrics_panel.png`
-- qualitative detailed comparison cards in `--vis-dir`:
-	- Original image
-	- Ground-truth density map
-	- Predicted density map
-	- Embedded stats: GT count, predicted count, error, MAE, MSE
-
-## 4) Real-Time Crowd Monitoring (Milestone 3)
-
-Webcam:
+Folder of images:
 
 ```bash
-python -m project.inference.realtime \
-	--model csrnet \
-	--checkpoint project/data/runs/csrnet_partA/checkpoints/best.pt \
-	--source 0 \
-	--max-dim 1280 \
-	--use-fp16 \
-	--global-count-threshold 120 \
-	--region-grid 4 \
-	--region-density-threshold 0.0025
+python -m inference.image_inference \
+  --input path/to/images \
+  --checkpoint checkpoints/csrnet_best.pth \
+  --output-dir outputs/image_inference
 ```
 
-Video file:
+## Video Inference
 
 ```bash
-python -m project.inference.realtime \
-	--model csrnet \
-	--checkpoint project/data/runs/csrnet_partA/checkpoints/best.pt \
-	--source input_video.mp4 \
-	--output project/data/output/annotated.mp4 \
-	--max-dim 1280 \
-	--use-fp16
+python -m inference.video_inference \
+  --input input.mp4 \
+  --output outputs/annotated.mp4 \
+  --checkpoint checkpoints/csrnet_best.pth \
+  --sample-fps 2 \
+  --threshold 120
 ```
 
-Press `q` to stop.
-
-## 5) FPS Measurement
+## Webcam Inference
 
 ```bash
-python -m project.inference.benchmark \
-	--model csrnet \
-	--checkpoint project/data/runs/csrnet_partA/checkpoints/best.pt \
-	--image part_A_final/test_data/images/IMG_1.jpg \
-	--max-dim 1280 \
-	--iters 200 \
-	--warmup 30 \
-	--fp16
+python -m inference.realtime \
+  --source 0 \
+  --checkpoint checkpoints/csrnet_best.pth \
+  --threshold 120
 ```
 
-## Overcrowding Logic
+Press `q` to quit the webcam window.
 
-Per frame workflow:
+## React Dashboard
 
-1. Video/Webcam frame input
-2. Resize with max-dimension constraint
-3. Normalize (ImageNet stats)
-4. CSRNet inference
-5. Density map to count (`sum(density)`)
-6. Overcrowding check:
-	 - global count threshold
-	 - region-based density threshold
-7. Alert output:
-	 - console alert
-	 - visual status (`SAFE` / `OVERCROWDED`) and red border when triggered
+The project now includes a modern React/Vite dashboard with a FastAPI inference backend.
 
-## Expected Performance Targets
+Backend API:
 
-- ShanghaiTech Part A MAE: ~65 to 85 (well-trained CSRNet)
-- ShanghaiTech Part B MAE: ~8 to 15 (well-trained CSRNet)
-- Real-time inference: >= 10 FPS on CUDA GPU (input-size and hardware dependent)
+```bash
+python -m api.server
+```
+
+Frontend UI:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The React dashboard supports:
+
+- Model selection from all trained checkpoints
+- Image upload with overlay + density-only outputs
+- Video upload with overlay + density-only videos
+- Browser webcam sampling for live analysis
+- Polished glass-style UI with embedded crowd count HUD
+
+Streamlit remains available as a fallback dashboard in `dashboard/app.py`, but the React frontend is the new primary UI path.
+
+## Modern Dashboard (Live + Upload)
+
+Run the dashboard:
+
+```bash
+streamlit run dashboard/app.py
+```
+
+Dashboard capabilities:
+
+- Live webcam monitoring with side-by-side outputs:
+  - Overlay frame (video frame + density map)
+  - Density-only frame
+- Upload image and get both outputs saved and previewed.
+- Upload video and generate two videos:
+  - Overlay output video
+  - Density-only output video
+
+Default dashboard model paths are preconfigured to the strongest checkpoint and calibration:
+
+- `checkpoints/high_accuracy_best_partA.pth`
+- `outputs/count_calibration_partA_push_v1_mae.json`
 
 ## Notes
 
-- Use `--max-dim` to balance speed and accuracy.
-- Caching adaptive density maps is critical for stable training throughput.
-- If GPU memory is tight, reduce `--batch-size` and `--crop-size`.
-- Repository upload checklist: see `GITHUB_PREP.md`.
+- The density map cache is stored in `cache/density_maps`.
+- The model outputs a single-channel density map and the crowd count is the sum of that map.
+- Video and webcam processing support frame sampling for faster inference.

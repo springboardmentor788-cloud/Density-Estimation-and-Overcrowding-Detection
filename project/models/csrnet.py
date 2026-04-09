@@ -1,78 +1,94 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-from torchvision import models
+from torch import nn
+
+
+def _conv_block(in_channels: int, out_channels: int, *, kernel_size: int = 3, padding: int = 1, dilation: int = 1) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation),
+        nn.ReLU(inplace=True),
+    )
+
+
+def _make_frontend() -> nn.Sequential:
+    layers = [
+        _conv_block(3, 64),
+        _conv_block(64, 64),
+        nn.MaxPool2d(2),
+        _conv_block(64, 128),
+        _conv_block(128, 128),
+        nn.MaxPool2d(2),
+        _conv_block(128, 256),
+        _conv_block(256, 256),
+        _conv_block(256, 256),
+        nn.MaxPool2d(2),
+        _conv_block(256, 512),
+        _conv_block(512, 512),
+        _conv_block(512, 512),
+    ]
+    return nn.Sequential(*layers)
+
+
+def _make_backend() -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(512, 512, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(512, 256, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(256, 128, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(128, 64, kernel_size=3, padding=2, dilation=2),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(64, 1, kernel_size=1),
+    )
 
 
 class CSRNet(nn.Module):
-    def __init__(self, load_pretrained_frontend: bool = True, use_batch_norm: bool = False) -> None:
+    def __init__(self, pretrained: bool = False, pretrained_path: str | Path | None = None) -> None:
         super().__init__()
-        self.frontend_cfg = [64, 64, "M", 128, 128, "M", 256, 256, 256, "M", 512, 512, 512]
-        self.backend_cfg = [512, 512, 512, 256, 128, 64]
+        self.frontend = _make_frontend()
+        self.backend = _make_backend()
 
-        self.frontend = make_layers(self.frontend_cfg, batch_norm=use_batch_norm, dilation=False)
-        self.backend = make_layers(self.backend_cfg, in_channels=512, batch_norm=use_batch_norm, dilation=True)
-        self.output_layer = nn.Conv2d(64, 1, kernel_size=1)
-
-        self._initialize_weights()
-        if load_pretrained_frontend:
-            self._load_vgg16_frontend()
+        if pretrained_path is not None:
+            self.load_weights(pretrained_path)
+        elif pretrained:
+            self._try_load_torchvision_frontend()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.frontend(x)
         x = self.backend(x)
-        x = self.output_layer(x)
-        return x
+        return torch.relu(x)
 
-    def _load_vgg16_frontend(self) -> None:
-        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-        frontend_state = self.frontend.state_dict()
-        vgg_state = vgg.features.state_dict()
+    def _try_load_torchvision_frontend(self) -> None:
+        try:
+            from torchvision.models import VGG16_Weights, vgg16
+        except Exception:
+            return
 
-        mapped = {}
-        for k in frontend_state.keys():
-            if k in vgg_state and frontend_state[k].shape == vgg_state[k].shape:
-                mapped[k] = vgg_state[k]
+        try:
+            vgg = vgg16(weights=VGG16_Weights.DEFAULT)
+            vgg_features = list(vgg.features.children())[:23]
+            source = nn.Sequential(*vgg_features)
+            self.frontend.load_state_dict(source.state_dict(), strict=False)
+        except Exception:
+            return
 
-        frontend_state.update(mapped)
-        self.frontend.load_state_dict(frontend_state)
-
-    def _initialize_weights(self) -> None:
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-
-def make_layers(
-    cfg,
-    in_channels: int = 3,
-    batch_norm: bool = False,
-    dilation: bool = False,
-) -> nn.Sequential:
-    d_rate = 2 if dilation else 1
-    layers = []
-
-    for v in cfg:
-        if v == "M":
-            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+    def load_weights(self, checkpoint_path: str | Path, map_location: str | torch.device = "cpu") -> None:
+        state = torch.load(str(checkpoint_path), map_location=map_location)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            self.load_state_dict(state["model_state_dict"], strict=False)
+        elif isinstance(state, dict):
+            self.load_state_dict(state, strict=False)
         else:
-            conv2d = nn.Conv2d(
-                in_channels,
-                v,
-                kernel_size=3,
-                padding=d_rate,
-                dilation=d_rate,
-            )
-            if batch_norm:
-                layers.extend([conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)])
-            else:
-                layers.extend([conv2d, nn.ReLU(inplace=True)])
-            in_channels = v
+            raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
 
-    return nn.Sequential(*layers)
+    def predict_count(self, x: torch.Tensor) -> torch.Tensor:
+        density = self(x)
+        return density.flatten(1).sum(dim=1)

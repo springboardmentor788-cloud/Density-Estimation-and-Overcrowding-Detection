@@ -1,223 +1,348 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Iterable
 
-import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
 
-from project.config import IMAGENET_MEAN, IMAGENET_STD
-from project.dataset.density_map import load_or_create_density_map
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
 
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
 
-def get_part_root(dataset_root: Path, part: str) -> Path:
-    part = part.upper()
-    if part not in {"A", "B"}:
-        raise ValueError("part must be one of: A, B")
-    return dataset_root / f"part_{part}_final"
+try:
+    import torch
+    from torch.utils.data import ConcatDataset, Dataset
+except Exception:  # pragma: no cover
+    torch = None
+    ConcatDataset = object
+    Dataset = object
 
-
-def list_image_paths(dataset_root: Path, part: str, split: str) -> List[Path]:
-    part_root = get_part_root(dataset_root, part)
-    image_dir = part_root / f"{split}_data" / "images"
-    images = sorted(image_dir.glob("*.jpg"))
-    if not images:
-        images = sorted(image_dir.glob("*.png"))
-    if not images:
-        raise FileNotFoundError(f"No images found in {image_dir}")
-    return images
-
-
-def image_to_mat_path(image_path: Path) -> Path:
-    gt_dir = image_path.parent.parent / "ground_truth"
-    mat_name = image_path.stem.replace("IMG_", "GT_IMG_") + ".mat"
-    return gt_dir / mat_name
+from dataset.density_map import (
+    density_cache_path,
+    load_or_create_density_map,
+    load_points_from_mat_cached,
+)
+from config import CONFIG
 
 
-def resize_with_max_dim(image: np.ndarray, max_dim: int) -> np.ndarray:
-    h, w = image.shape[:2]
-    scale = min(1.0, float(max_dim) / float(max(h, w)))
-    if scale == 1.0:
-        return image
-
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-class CrowdCountingDataset(Dataset):
+def _read_image(path: str | Path) -> np.ndarray:
+    path = str(path)
+    if cv2 is not None:
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(path)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if Image is None:
+        raise RuntimeError("Neither cv2 nor PIL is available for image loading")
+    return np.asarray(Image.open(path).convert("RGB"))
+
+
+def _resize_image(image: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
+    height, width = size_hw
+    if cv2 is not None:
+        return cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+    if Image is None:
+        raise RuntimeError("Neither cv2 nor PIL is available for image resizing")
+    return np.asarray(Image.fromarray(image).resize((width, height), Image.BILINEAR))
+
+
+def _resize_density_map(density: np.ndarray, size_hw: tuple[int, int]) -> np.ndarray:
+    height, width = size_hw
+    if density.shape[:2] == (height, width):
+        return density.astype(np.float32)
+    if cv2 is not None:
+        resized = cv2.resize(density.astype(np.float32), (width, height), interpolation=cv2.INTER_AREA)
+    else:
+        if Image is None:
+            raise RuntimeError("Neither cv2 nor PIL is available for density resizing")
+        resized = np.asarray(Image.fromarray(density.astype(np.float32)).resize((width, height), Image.BILINEAR), dtype=np.float32)
+    scale = (density.shape[0] * density.shape[1]) / float(height * width)
+    return resized.astype(np.float32) * scale
+
+
+def _flip_points_horizontal(points: np.ndarray, width: int) -> np.ndarray:
+    flipped = points.copy()
+    flipped[:, 0] = (width - 1) - flipped[:, 0]
+    return flipped
+
+
+def _crop_image_and_points(
+    image: np.ndarray,
+    points: np.ndarray,
+    top: int,
+    left: int,
+    crop_h: int,
+    crop_w: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    cropped = image[top : top + crop_h, left : left + crop_w]
+    shifted = points.copy()
+    shifted[:, 0] -= left
+    shifted[:, 1] -= top
+    mask = (
+        (shifted[:, 0] >= 0)
+        & (shifted[:, 0] < crop_w)
+        & (shifted[:, 1] >= 0)
+        & (shifted[:, 1] < crop_h)
+    )
+    return cropped, shifted[mask]
+
+
+@dataclass(slots=True)
+class CrowdSample:
+    sample_id: str
+    image_path: Path
+    mat_path: Path
+
+
+class CrowdCountDataset(Dataset):
     def __init__(
         self,
-        dataset_root: Path,
-        part: str,
-        split: str,
-        cache_root: Path,
-        max_dim: int = 1536,
-        crop_size: int = 512,
-        output_stride: int = 8,
-        train: bool = True,
+        data_root: str | Path,
+        *,
+        split: str = "train",
+        val_fraction: float = 0.2,
+        resize_to: tuple[int, int] | None = None,
+        crop_size: tuple[int, int] | None = None,
         random_flip: bool = True,
+        random_crop: bool = False,
+        use_cache: bool = True,
+        sigma_scale: float = 0.3,
+        min_sigma: float = 4.0,
+        knn: int = 4,
+        seed: int = 42,
+        max_samples: int | None = None,
     ) -> None:
-        self.dataset_root = Path(dataset_root)
-        self.part = part
-        self.split = split
-        self.cache_root = Path(cache_root)
-        self.max_dim = max_dim
+        self.data_root = Path(data_root)
+        self.split = split.lower()
+        self.val_fraction = float(val_fraction)
+        self.resize_to = resize_to
         self.crop_size = crop_size
-        self.output_stride = output_stride
-        self.train = train
         self.random_flip = random_flip
+        self.random_crop = random_crop
+        self.use_cache = use_cache
+        self.sigma_scale = sigma_scale
+        self.min_sigma = min_sigma
+        self.knn = knn
+        self.seed = seed
+        self.max_samples = max_samples
 
-        self.image_paths = list_image_paths(self.dataset_root, part, split)
+        if self.split not in {"train", "val", "test", "predict"}:
+            raise ValueError(f"Unsupported split: {split}")
+
+        if self.split in {"test", "predict"}:
+            image_dir = self.data_root / "test_data" / "images"
+            gt_dir = self.data_root / "test_data" / "ground_truth"
+            self.samples = self._collect_samples(image_dir, gt_dir)
+        else:
+            image_dir = self.data_root / "train_data" / "images"
+            gt_dir = self.data_root / "train_data" / "ground_truth"
+            samples = self._collect_samples(image_dir, gt_dir)
+            rng = random.Random(self.seed)
+            rng.shuffle(samples)
+            split_index = max(1, int(round(len(samples) * (1.0 - self.val_fraction))))
+            if self.split == "train":
+                self.samples = samples[:split_index]
+            else:
+                self.samples = samples[split_index:]
+
+        if self.max_samples is not None:
+            self.samples = self.samples[: self.max_samples]
+
+    def _collect_samples(self, image_dir: Path, gt_dir: Path) -> list[CrowdSample]:
+        samples: list[CrowdSample] = []
+        if not image_dir.exists():
+            raise FileNotFoundError(image_dir)
+
+        for image_path in sorted(image_dir.iterdir()):
+            if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                continue
+            sample_id = image_path.stem
+            mat_name = sample_id.replace("IMG", "GT_IMG") + ".mat"
+            mat_path = gt_dir / mat_name
+            if not mat_path.exists():
+                raise FileNotFoundError(mat_path)
+            samples.append(CrowdSample(sample_id=sample_id, image_path=image_path, mat_path=mat_path))
+        return samples
 
     def __len__(self) -> int:
-        return len(self.image_paths)
+        return len(self.samples)
 
-    def _normalize(self, image: np.ndarray) -> torch.Tensor:
-        image = image.astype(np.float32) / 255.0
-        image = (image - np.array(IMAGENET_MEAN, dtype=np.float32)) / np.array(IMAGENET_STD, dtype=np.float32)
-        image = np.transpose(image, (2, 0, 1))
-        return torch.from_numpy(image).float()
+    def _maybe_augment(
+        self, image: np.ndarray, points: np.ndarray, rng: random.Random
+    ) -> tuple[np.ndarray, np.ndarray]:
+        height, width = image.shape[:2]
 
-    def _crop_pair(self, image: np.ndarray, density: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if not self.train:
-            # For evaluation keep full frame but enforce output-stride-aligned spatial shape.
-            ih, iw = image.shape[:2]
-            ih_aligned = max(self.output_stride, (ih // self.output_stride) * self.output_stride)
-            iw_aligned = max(self.output_stride, (iw // self.output_stride) * self.output_stride)
-            image = image[:ih_aligned, :iw_aligned]
-            d_h = ih_aligned // self.output_stride
-            d_w = iw_aligned // self.output_stride
-            density = density[:d_h, :d_w]
-            return np.ascontiguousarray(image), np.ascontiguousarray(density)
+        if self.random_flip and rng.random() < 0.5:
+            image = np.ascontiguousarray(image[:, ::-1])
+            points = _flip_points_horizontal(points, width)
 
-        ih, iw = image.shape[:2]
-        ch = min(self.crop_size, ih)
-        cw = min(self.crop_size, iw)
+        if self.random_crop and self.crop_size is not None:
+            crop_h, crop_w = self.crop_size
+            if height >= crop_h and width >= crop_w:
+                top = rng.randint(0, height - crop_h)
+                left = rng.randint(0, width - crop_w)
+                image, points = _crop_image_and_points(image, points, top, left, crop_h, crop_w)
 
-        if ih == ch:
-            top = 0
-        else:
-            top = random.randint(0, ih - ch)
+        return image, points
 
-        if iw == cw:
-            left = 0
-        else:
-            left = random.randint(0, iw - cw)
+    def _resize_points(self, points: np.ndarray, original_shape: tuple[int, int], target_shape: tuple[int, int]) -> np.ndarray:
+        original_h, original_w = original_shape
+        target_h, target_w = target_shape
+        if original_h == target_h and original_w == target_w:
+            return points
 
-        image_crop = image[top : top + ch, left : left + cw]
+        scale_x = target_w / float(original_w)
+        scale_y = target_h / float(original_h)
+        resized = points.copy().astype(np.float32)
+        resized[:, 0] *= scale_x
+        resized[:, 1] *= scale_y
+        return resized
 
-        d_top = top // self.output_stride
-        d_left = left // self.output_stride
-        d_ch = max(1, ch // self.output_stride)
-        d_cw = max(1, cw // self.output_stride)
-        density_crop = density[d_top : d_top + d_ch, d_left : d_left + d_cw]
+    def _augment_density(self, density: np.ndarray, image: np.ndarray, points: np.ndarray, rng: random.Random) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        height, width = image.shape[:2]
 
-        # Force fixed-size crops for batch collation stability.
-        tgt_h = self.crop_size
-        tgt_w = self.crop_size
-        if image_crop.shape[0] != tgt_h or image_crop.shape[1] != tgt_w:
-            image_crop = cv2.resize(image_crop, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
+        if self.random_flip and rng.random() < 0.5:
+            image = np.ascontiguousarray(image[:, ::-1])
+            density = np.ascontiguousarray(density[:, ::-1])
+            points = _flip_points_horizontal(points, width)
 
-        tgt_dh = max(1, tgt_h // self.output_stride)
-        tgt_dw = max(1, tgt_w // self.output_stride)
-        if density_crop.shape[0] != tgt_dh or density_crop.shape[1] != tgt_dw:
-            density_crop = cv2.resize(density_crop, (tgt_dw, tgt_dh), interpolation=cv2.INTER_AREA)
-            orig_sum = float(density[d_top : d_top + d_ch, d_left : d_left + d_cw].sum())
-            new_sum = float(density_crop.sum())
-            if new_sum > 0:
-                density_crop *= orig_sum / new_sum
+        if self.random_crop and self.crop_size is not None:
+            crop_h, crop_w = self.crop_size
+            if height >= crop_h and width >= crop_w:
+                top = rng.randint(0, height - crop_h)
+                left = rng.randint(0, width - crop_w)
+                image, points = _crop_image_and_points(image, points, top, left, crop_h, crop_w)
+                density = density[top : top + crop_h, left : left + crop_w]
 
-        return np.ascontiguousarray(image_crop), np.ascontiguousarray(density_crop)
+        return image, density, points
 
-    def __getitem__(self, idx: int):
-        image_path = self.image_paths[idx]
-        mat_path = image_to_mat_path(image_path)
-
-        image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image_bgr is None:
-            raise RuntimeError(f"Failed to read image: {image_path}")
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        orig_h, orig_w = image_rgb.shape[:2]
-        image_rgb = resize_with_max_dim(image_rgb, self.max_dim)
-
-        h, w = image_rgb.shape[:2]
-        scale_x = float(w) / float(max(orig_w, 1))
-        scale_y = float(h) / float(max(orig_h, 1))
-        density = load_or_create_density_map(
-            image_path=image_path,
-            mat_path=mat_path,
-            image_shape=(h, w),
-            cache_root=self.cache_root / f"part_{self.part.upper()}_{self.split}",
-            output_stride=self.output_stride,
-            point_scale=(scale_x, scale_y),
+    def __getitem__(self, index: int) -> dict[str, object]:
+        sample = self.samples[index]
+        image = _read_image(sample.image_path)
+        points = load_points_from_mat_cached(str(sample.mat_path)).copy()
+        base_density = load_or_create_density_map(
+            image.shape[:2],
+            points,
+            density_cache_path(self.data_root / "cache" / "density_maps", sample.sample_id, image.shape[:2]) if self.use_cache else None,
+            knn=self.knn,
+            sigma_scale=self.sigma_scale,
+            min_sigma=self.min_sigma,
         )
 
-        image_rgb, density = self._crop_pair(image_rgb, density)
+        rng = random.Random(self.seed + index)
+        if self.split == "train":
+            image, base_density, points = self._augment_density(base_density, image, points, rng)
 
-        if self.train and self.random_flip and random.random() < 0.5:
-            image_rgb = np.ascontiguousarray(np.fliplr(image_rgb))
-            density = np.ascontiguousarray(np.fliplr(density))
+        if self.resize_to is not None:
+            original_shape = image.shape[:2]
+            image = _resize_image(image, self.resize_to)
+            points = self._resize_points(points, original_shape, self.resize_to)
+            base_density = _resize_density_map(base_density, self.resize_to)
 
-        image_tensor = self._normalize(image_rgb)
-        density_tensor = torch.from_numpy(density).unsqueeze(0).float()
-
-        if not self.train:
-            # Pad eval samples to a common size per batch-friendly stride multiples.
-            h, w = image_tensor.shape[1:]
-            d_h, d_w = density_tensor.shape[1:]
-            h_aligned = max(self.output_stride, ((h + self.output_stride - 1) // self.output_stride) * self.output_stride)
-            w_aligned = max(self.output_stride, ((w + self.output_stride - 1) // self.output_stride) * self.output_stride)
-            if h != h_aligned or w != w_aligned:
-                image_tensor = F.pad(image_tensor, (0, w_aligned - w, 0, h_aligned - h), mode="constant", value=0.0)
-            target_dh = h_aligned // self.output_stride
-            target_dw = w_aligned // self.output_stride
-            if d_h != target_dh or d_w != target_dw:
-                density_tensor = F.pad(density_tensor, (0, target_dw - d_w, 0, target_dh - d_h), mode="constant", value=0.0)
-
-        count = density_tensor.sum().item()
+        height, width = image.shape[:2]
+        image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1)
+        mean = torch.tensor(CONFIG.image_mean, dtype=torch.float32).view(3, 1, 1)
+        std = torch.tensor(CONFIG.image_std, dtype=torch.float32).view(3, 1, 1)
+        image_tensor = (image_tensor - mean) / std
+        density_tensor = torch.from_numpy(base_density.astype(np.float32)).unsqueeze(0)
 
         return {
             "image": image_tensor,
             "density": density_tensor,
-            "count": torch.tensor(count, dtype=torch.float32),
-            "image_path": str(image_path),
+            "count": float(base_density.sum()),
+            "sample_id": sample.sample_id,
+            "image_path": str(sample.image_path),
+            "mat_path": str(sample.mat_path),
+            "shape": (height, width),
         }
 
 
-def create_dataloader(
-    dataset_root: Path,
-    part: str,
-    split: str,
-    cache_root: Path,
-    batch_size: int,
-    workers: int,
-    max_dim: int,
-    crop_size: int,
-    output_stride: int,
-    train: bool,
-) -> DataLoader:
-    dataset = CrowdCountingDataset(
-        dataset_root=dataset_root,
-        part=part,
-        split=split,
-        cache_root=cache_root,
-        max_dim=max_dim,
-        crop_size=crop_size,
-        output_stride=output_stride,
-        train=train,
-    )
+def build_crowd_datasets(
+    data_roots: Iterable[str | Path],
+    *,
+    val_fraction: float = 0.2,
+    resize_to: tuple[int, int] | None = None,
+    crop_size: tuple[int, int] | None = None,
+    random_flip: bool = True,
+    random_crop: bool = False,
+    use_cache: bool = True,
+    sigma_scale: float = 0.3,
+    min_sigma: float = 4.0,
+    knn: int = 4,
+    seed: int = 42,
+    max_samples: int | None = None,
+):
+    train_sets = []
+    val_sets = []
+    test_sets = []
 
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=train,
-        num_workers=workers,
-        pin_memory=True,
-        persistent_workers=workers > 0,
-        drop_last=False,
-    )
+    for data_root in data_roots:
+        train_sets.append(
+            CrowdCountDataset(
+                data_root,
+                split="train",
+                val_fraction=val_fraction,
+                resize_to=resize_to,
+                crop_size=crop_size,
+                random_flip=random_flip,
+                random_crop=random_crop,
+                use_cache=use_cache,
+                sigma_scale=sigma_scale,
+                min_sigma=min_sigma,
+                knn=knn,
+                seed=seed,
+                max_samples=max_samples,
+            )
+        )
+        val_sets.append(
+            CrowdCountDataset(
+                data_root,
+                split="val",
+                val_fraction=val_fraction,
+                resize_to=resize_to,
+                crop_size=None,
+                random_flip=False,
+                random_crop=False,
+                use_cache=use_cache,
+                sigma_scale=sigma_scale,
+                min_sigma=min_sigma,
+                knn=knn,
+                seed=seed,
+                max_samples=max_samples,
+            )
+        )
+        test_sets.append(
+            CrowdCountDataset(
+                data_root,
+                split="test",
+                resize_to=resize_to,
+                crop_size=None,
+                random_flip=False,
+                random_crop=False,
+                use_cache=use_cache,
+                sigma_scale=sigma_scale,
+                min_sigma=min_sigma,
+                knn=knn,
+                seed=seed,
+                max_samples=max_samples,
+            )
+        )
+
+    if torch is None:
+        raise RuntimeError("torch is required to combine datasets")
+
+    train_dataset = train_sets[0] if len(train_sets) == 1 else ConcatDataset(train_sets)
+    val_dataset = val_sets[0] if len(val_sets) == 1 else ConcatDataset(val_sets)
+    test_dataset = test_sets[0] if len(test_sets) == 1 else ConcatDataset(test_sets)
+    return train_dataset, val_dataset, test_dataset

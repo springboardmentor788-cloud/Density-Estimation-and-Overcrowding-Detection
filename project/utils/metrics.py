@@ -1,41 +1,31 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from typing import Iterable
 
-import torch
+import numpy as np
 
 
-@dataclass
-class RunningMetrics:
-    n: int = 0
-    mae_sum: float = 0.0
-    mse_sum: float = 0.0
-    gt_sum: float = 0.0
-    gt_sq_sum: float = 0.0
+def mae(predictions: Iterable[float], targets: Iterable[float]) -> float:
+    pred = np.asarray(list(predictions), dtype=np.float64)
+    tgt = np.asarray(list(targets), dtype=np.float64)
+    if pred.size == 0:
+        return 0.0
+    return float(np.mean(np.abs(pred - tgt)))
 
-    def update(self, pred_count: torch.Tensor, gt_count: torch.Tensor) -> None:
-        diff = pred_count.detach() - gt_count.detach()
-        gt = gt_count.detach()
-        self.mae_sum += torch.abs(diff).sum().item()
-        self.mse_sum += torch.square(diff).sum().item()
-        self.gt_sum += gt.sum().item()
-        self.gt_sq_sum += torch.square(gt).sum().item()
-        self.n += int(diff.numel())
 
-    @property
-    def mae(self) -> float:
-        return self.mae_sum / max(1, self.n)
+def rmse(predictions: Iterable[float], targets: Iterable[float]) -> float:
+    pred = np.asarray(list(predictions), dtype=np.float64)
+    tgt = np.asarray(list(targets), dtype=np.float64)
+    if pred.size == 0:
+        return 0.0
+    return float(math.sqrt(np.mean((pred - tgt) ** 2)))
 
-    @property
-    def rmse(self) -> float:
-        return math.sqrt(self.mse_sum / max(1, self.n))
 
-    @property
-    def r2(self) -> float:
-        if self.n <= 1:
-            return float("nan")
-        ss_tot = self.gt_sq_sum - (self.gt_sum * self.gt_sum) / self.n
-        if ss_tot <= 1e-12:
-            return float("nan")
-        return 1.0 - (self.mse_sum / ss_tot)
+def summarize_counts(predictions: list[float], targets: list[float]) -> dict[str, float]:
+    return {
+        "mae": mae(predictions, targets),
+        "rmse": rmse(predictions, targets),
+        "pred_mean": float(np.mean(predictions)) if predictions else 0.0,
+        "target_mean": float(np.mean(targets)) if targets else 0.0,
+    }
