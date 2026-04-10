@@ -45,8 +45,8 @@ CROWD_THRESHOLD = 100     # 🔥 adjust per video
 # Training Settings
 # ----------------------------
 BATCH_SIZE = 1
-EPOCHS = 20
-LEARNING_RATE = 1e-5
+EPOCHS = 15
+LEARNING_RATE = 1e-7
 
 # ----------------------------
 # Device
