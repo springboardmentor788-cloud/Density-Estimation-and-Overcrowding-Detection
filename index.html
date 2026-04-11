@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CrowdVision | AI Counter</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <!-- Boxicons for Icons -->
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body>
+    <div class="dashboard">
+        <!-- Sidebar Options -->
+        <aside class="sidebar">
+            <div class="logo-container">
+                <div class="logo-icon">
+                    <i class='bx bx-group'></i>
+                </div>
+                <div class="logo-text">
+                    <h2>CrowdVision</h2>
+                    <p>AI COUNTER</p>
+                </div>
+            </div>
+            <ul class="nav">
+                <li><i class='bx bx-home-alt'></i> Dashboard</li>
+                <li><i class='bx bx-upload'></i> Upload</li>
+                <li><i class='bx bx-show'></i> Results</li>
+                <li class="active">
+                    <div class="nav-item-content"><i class='bx bx-bar-chart-alt-2'></i> Analytics</div>
+                    <i class='bx bx-chevron-right'></i>
+                </li>
+            </ul>
+        </aside>
+
+        <!-- Main Workspace -->
+        <main class="main-content">
+            <header>
+                <div class="header-titles">
+                    <h1>Analytics</h1>
+                    <p>Crowd count trends and session history</p>
+                </div>
+                <div class="user-info">
+                    <i class='bx bx-user-circle'></i>
+                    <i class='bx bx-dots-horizontal-rounded'></i>
+                </div>
+            </header>
+
+            <!-- Dashboard Stats -->
+            <div class="stats-panel">
+                <div class="stat-card accent-teal">
+                    <div class="card-bg-circle"></div>
+                    <div class="icon-box">
+                        <i class='bx bx-group'></i>
+                    </div>
+                    <div class="stat-value" id="crowdCount">--</div>
+                    <div class="stat-label">Current Count</div>
+                    <div class="stat-subtext">Live session</div>
+                </div>
+
+                <div class="stat-card accent-dynamic" id="statusCard">
+                    <div class="card-bg-circle"></div>
+                    <div class="icon-box" id="statusIconBox">
+                        <i class='bx bx-bell' id="statusIcon"></i>
+                    </div>
+                    <div class="stat-value" id="alertStatus" style="font-size: 2.2rem;">Connecting...</div>
+                    <div class="stat-label">Alert Status</div>
+                    <div class="stat-subtext" id="statusSubtext">System normal</div>
+                </div>
+
+                <div class="stat-card accent-orange">
+                    <div class="card-bg-circle"></div>
+                    <div class="icon-box">
+                        <i class='bx bx-chip'></i>
+                    </div>
+                    <div class="stat-value" id="hardwareStatus">GPU</div>
+                    <div class="stat-label">Hardware Acceleration</div>
+                    <div class="stat-subtext">CUDA enabled</div>
+                </div>
+            </div>
+
+            <div class="video-container">
+                <div class="video-card">
+                    <img src="{{ url_for('video_feed') }}" alt="Video Stream" class="video-stream">
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Real-time stat fetching logic
+        async function fetchStats() {
+            try {
+                const response = await fetch('/stats');
+                const data = await response.json();
+
+                document.getElementById('crowdCount').innerText = data.count;
+
+                const alertText = data.status === "OVERCROWDED" ? "ALERT" : "NORMAL";
+                document.getElementById('alertStatus').innerText = alertText;
+
+                const statusCard = document.getElementById('statusCard');
+                const statusIcon = document.getElementById('statusIcon');
+                const statusSubtext = document.getElementById('statusSubtext');
+
+                if (data.status === "OVERCROWDED") {
+                    statusCard.className = 'stat-card accent-red';
+                    statusIcon.className = 'bx bx-error';
+                    statusSubtext.innerText = 'Threshold exceeded';
+                } else {
+                    statusCard.className = 'stat-card accent-green';
+                    statusIcon.className = 'bx bx-check-shield';
+                    statusSubtext.innerText = 'Capacity optimal';
+                }
+            } catch (error) {
+                console.error('Error fetching stats:', error);
+            }
+        }
+
+        // Fetch every 1 second
+        setInterval(fetchStats, 1000);
+    </script>
+</body>
+
+</html>
