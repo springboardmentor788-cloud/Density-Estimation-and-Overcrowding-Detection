@@ -1,45 +1,60 @@
-import matplotlib
-matplotlib.use('TkAgg')  # Fix for Windows (graph display)
-
+import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
 
+from dataset import get_dataloaders
+from models.csrnet import CSRNet
+import config
 
-# ================= TRAIN FUNCTION =================
-def train(model, train_loader, val_loader, device, epochs=20, lr=1e-5):
 
-    print("🚀 Starting training...")
+def train():
 
-    model = model.to(device)
+    print("🚀 Training started")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = CSRNet().to(device)
+
+    # ✅ LOAD PREVIOUS MODEL IF EXISTS
+    if os.path.exists("best_model.pth"):
+        model.load_state_dict(torch.load("best_model.pth", map_location=device))
+        print("✅ Loaded existing best_model.pth (Resuming training)")
+    else:
+        print("⚠️ No pretrained model found, training from scratch")
+
+    print("✅ Training full model (frontend + backend)")
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_mae = float("inf")
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config.LEARNING_RATE
+    )
 
-    train_losses = []
-    val_mae_list = []
+    loader = get_dataloaders()
 
-    for epoch in range(epochs):
+    losses = []
+    maes = []
+
+    best_mae = float("inf")  # 🔥 Track best model
+
+    for epoch in range(config.EPOCHS):
 
         model.train()
-        epoch_loss = 0
 
-        for batch_idx, (images, density_maps) in enumerate(train_loader):
+        epoch_loss = 0
+        epoch_mae = 0
+
+        for images, targets in loader:
 
             images = images.to(device)
-            density_maps = density_maps.to(device)
+            targets = targets.to(device)
 
             outputs = model(images)
 
-            # Debug shapes (first batch only)
-            if epoch == 0 and batch_idx == 0:
-                print("Image shape:", images.shape)
-                print("GT shape:", density_maps.shape)
-                print("Output shape:", outputs.shape)
-
-            loss = criterion(outputs, density_maps)
+            loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
             loss.backward()
@@ -47,100 +62,46 @@ def train(model, train_loader, val_loader, device, epochs=20, lr=1e-5):
 
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / len(train_loader)
-        train_losses.append(avg_loss)
+            # ✅ MAE calculation
+            pred_count = outputs.detach().cpu().numpy().sum()
+            gt_count = targets.detach().cpu().numpy().sum()
 
-        print(f"\n📌 Epoch [{epoch+1}/{epochs}]")
-        print(f"Training Loss: {avg_loss:.4f}")
+            epoch_mae += abs(pred_count - gt_count)
 
-        # Validation
-        val_mae = validate(model, val_loader, device)
-        val_mae_list.append(val_mae)
+        avg_loss = epoch_loss / len(loader)
+        avg_mae = epoch_mae / len(loader)
 
-        # Save best model
-        if val_mae < best_mae:
-            best_mae = val_mae
+        losses.append(avg_loss)
+        maes.append(avg_mae)
+
+        print(f"Epoch [{epoch+1}/{config.EPOCHS}] Loss: {avg_loss:.4f} | MAE: {avg_mae:.2f}")
+
+        # ✅ SAVE ONLY BEST MODEL
+        if avg_mae < best_mae:
+            best_mae = avg_mae
             torch.save(model.state_dict(), "best_model.pth")
-            print("✅ Best model saved!")
+            print(f"💾 Saved NEW best model (MAE: {best_mae:.2f})")
 
-        # Save every epoch
-        torch.save(model.state_dict(), f"csrnet_epoch_{epoch+1}.pth")
+    print("✅ Training complete")
 
-    # Plot graphs
-    print("📊 Plotting graphs...")
-    plot_training_curves(train_losses, val_mae_list)
-
-
-# ================= VALIDATION =================
-def validate(model, val_loader, device):
-
-    model.eval()
-    mae = 0
-
-    with torch.no_grad():
-        for images, density_maps in val_loader:
-
-            images = images.to(device)
-            density_maps = density_maps.to(device)
-
-            outputs = model(images)
-
-            pred_count = outputs.sum().item()
-            gt_count = density_maps.sum().item()
-
-            mae += abs(pred_count - gt_count)
-
-    mae /= len(val_loader)
-
-    print(f"Validation MAE: {mae:.2f}")
-    return mae
-
-
-# ================= GRAPHING =================
-def plot_training_curves(train_losses, val_mae_list):
-
-    # Loss curve
+    # 📊 Plot Loss
     plt.figure()
-    plt.plot(train_losses, marker='o')
+    plt.plot(losses)
+    plt.title("Training Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Training Loss")
-    plt.title("Training Loss Curve")
-    plt.grid()
-    plt.savefig("loss_curve.png")
-    plt.close()
+    plt.ylabel("Loss")
+    plt.savefig("loss_plot.png")
 
-    # MAE curve
+    # 📊 Plot MAE
     plt.figure()
-    plt.plot(val_mae_list, marker='o')
+    plt.plot(maes)
+    plt.title("MAE (Count Error)")
     plt.xlabel("Epoch")
-    plt.ylabel("Validation MAE")
-    plt.title("Validation MAE Curve")
-    plt.grid()
-    plt.savefig("val_mae_curve.png")
-    plt.close()
+    plt.ylabel("MAE")
+    plt.savefig("mae_plot.png")
 
-    print("✅ Graphs saved: loss_curve.png, val_mae_curve.png")
+    print("📊 Plots saved")
 
 
-# ================= MAIN EXECUTION =================
 if __name__ == "__main__":
-
-    print("🚀 train.py is running...")
-
-    # 🔹 IMPORT YOUR FILES
-    from dataset import get_dataloaders
-    from models.csrnet import CSRNet
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-
-    # 🔹 LOAD DATA
-    train_loader, val_loader = get_dataloaders()
-    print("✅ Data loaded")
-
-    # 🔹 CREATE MODEL
-    model = CSRNet()
-    print("✅ Model created")
-
-    # 🔹 START TRAINING
-    train(model, train_loader, val_loader, device)
+    train()
