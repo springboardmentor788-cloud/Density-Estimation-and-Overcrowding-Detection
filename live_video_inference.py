@@ -2,6 +2,7 @@ import cv2
 import torch
 import numpy as np
 import os
+import time
 from csrnet import CSRNet
 
 # ==============================
@@ -14,24 +15,37 @@ model = CSRNet().to(device)
 model.load_state_dict(torch.load("csrnet.pth", map_location=device))
 model.eval()
 
-video_path = r"C:\Users\prane\Downloads\7353399-uhd_3840_2160_24fps.mp4"
-#video_path = r"C:\Users\prane\Downloads\12944695_2160_3840_30fps.mp4"
+# ==============================
+# LIVE CAMERA INPUT (REAL-TIME)
+# ==============================
+cap = cv2.VideoCapture(0)  # 0 = webcam
 
-cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    print("❌ Cannot access camera")
+    exit()
 
+# Get frame size
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps = cap.get(cv2.CAP_PROP_FPS)
 
-if fps == 0:
-    fps = 20
-
-# OUTPUT
-output_path = "Results/final_output.avi"
+# ==============================
+# OUTPUT VIDEO
+# ==============================
+output_path = "Results/realtime_output.avi"
 fourcc = cv2.VideoWriter_fourcc(*'XVID')
-out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+out = cv2.VideoWriter(output_path, fourcc, 20, (width, height))
 
+if not out.isOpened():
+    print("❌ VideoWriter failed")
+    exit()
+
+print("✅ Live processing started... Press 'q' to quit")
+
+# ==============================
+# SETTINGS
+# ==============================
 THRESHOLD = 150
+prev_time = time.time()
 
 # ==============================
 # LOOP
@@ -42,12 +56,15 @@ while True:
         break
 
     # ----------------------------
-    # MODEL INPUT
+    # PREPROCESS
     # ----------------------------
     img = cv2.resize(frame, (256, 256))
     img = img / 255.0
     img_tensor = torch.tensor(img).permute(2,0,1).unsqueeze(0).float().to(device)
 
+    # ----------------------------
+    # MODEL
+    # ----------------------------
     with torch.no_grad():
         output = model(img_tensor)
 
@@ -55,19 +72,18 @@ while True:
     count = density.sum()
 
     # ----------------------------
-    # HEATMAP (SMOOTHER)
+    # HEATMAP (SMOOTH)
     # ----------------------------
-    heatmap = cv2.GaussianBlur(density, (15,15), 0)
+    heatmap = cv2.GaussianBlur(density, (25,25), 0)
     heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
     heatmap = heatmap.astype(np.uint8)
     heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
     heatmap = cv2.resize(heatmap, (width, height))
-
     overlay = cv2.addWeighted(frame, 0.6, heatmap, 0.4, 0)
 
     # ----------------------------
-    # STATUS
+    # STATUS + ALERT
     # ----------------------------
     if count > THRESHOLD:
         status = "OVERCROWDED"
@@ -79,31 +95,33 @@ while True:
     text = f"Count: {int(count)} | Status: {status}"
 
     # ----------------------------
-    # BLACK BANNER
+    # BANNER UI
     # ----------------------------
     banner_height = 80
     cv2.rectangle(overlay, (0,0), (width, banner_height), (0,0,0), -1)
-
-    # RED BORDER
     cv2.rectangle(overlay, (5,5), (width-5, banner_height-5), (0,0,255), 2)
 
-    # TEXT
-    cv2.putText(
-        overlay,
-        text,
-        (20,50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,
-        color,
-        3
-    )
+    cv2.putText(overlay, text, (20,50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
 
     # ----------------------------
-    # SAVE FRAME
+    # FPS DISPLAY
+    # ----------------------------
+    current_time = time.time()
+    fps = 1 / (current_time - prev_time)
+    prev_time = current_time
+
+    cv2.putText(overlay, f"FPS: {int(fps)}",
+                (20, 110), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, (255,255,255), 2)
+
+    # ----------------------------
+    # SAVE + DISPLAY
     # ----------------------------
     out.write(overlay)
+    cv2.imshow("Real-Time Crowd Monitoring", overlay)
 
-    cv2.imshow("Output", overlay)
+    # EXIT KEY
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
@@ -114,4 +132,5 @@ cap.release()
 out.release()
 cv2.destroyAllWindows()
 
-print("✅ Saved:", output_path)
+print("✅ Finished")
+print("📁 Saved at:", output_path)
