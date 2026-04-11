@@ -1,4 +1,5 @@
 DeepVision: Real-Time Crowd Analytics Engine
+
 DeepVision is an advanced computer vision solution leveraging CSRNet (Congested Scene Recognition Network) to provide high-accuracy crowd counting and density estimation. The project features a professional Streamlit dashboard for real-time analysis across images, pre-recorded videos, and live camera feeds.
 
 Key Features
@@ -29,7 +30,7 @@ predict.py: Utility script for standalone inference on single images.
 video_inference.py / density_video.py: Logic for processing video files and generating regional density stats.
 gt_counts.npy / pred_counts.npy: Stored data for comparative accuracy analysis.
 
-🖥️ Dashboard Overview
+Dashboard Overview
 The DeepVision dashboard is designed for high-stakes monitoring environments.
 
 Analysis Modes:
@@ -45,6 +46,7 @@ Installation & Setup
 Clone the repository:
 Bash
 git clone --branch Jukti-Saxena https://github.com/springboardmentor788-cloud/Density-Estimation-and-Overcrowding-Detection.git
+
 cd Density-Estimation-and-Overcrowding-Detection
 
 Install Dependencies:
