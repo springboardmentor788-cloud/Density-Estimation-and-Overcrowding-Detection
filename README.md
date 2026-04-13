@@ -93,3 +93,17 @@ DeepVision employs **CSRNet (Congested Scene Recognition Network)**. It utilizes
 
 ## 🤝 Contribution
 Contributions, issues, and feature requests are welcome. Feel free to check the issues page.
+
+### Screenshots
+
+## 📊 Dashboard
+![Dashboard](images/dashboard.png)
+
+## 🔥 Settings
+![Heatmap](images/settings.png)
+
+## 📈 Analytics
+![Analytics](images/analytics.png)
+
+## 📈 Result
+![Analytics](images/result.png)
